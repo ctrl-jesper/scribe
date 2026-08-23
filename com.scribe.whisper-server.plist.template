@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.scribe.whisper-server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/whisper-server</string>
+        <string>-m</string>
+        <string>__MODEL_PATH__</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>__PORT__</string>
+        <string>-t</string>
+        <string>4</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__HOME__/.config/scribe/state/whisper-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.config/scribe/state/whisper-server.err</string>
+</dict>
+</plist>

@@ -1,0 +1,274 @@
+# Scribe
+
+Local, private, free push-to-talk dictation for macOS, with your own vocabulary.
+
+## Why
+
+Cloud dictation tools are usually a subscription, and they send your audio to a server you
+do not control. Scribe runs [whisper.cpp](https://github.com/ggerganov/whisper.cpp) entirely
+on your Mac, through a warm background server so there is no per-dictation model reload, with
+a personal vocabulary that boosts the names and jargon you actually say, and an optional AI
+cleanup pass that runs through your own Claude CLI, on your own subscription. Hold a key,
+talk, release. The text is typed wherever your cursor is.
+
+## Requirements
+
+- macOS (Apple Silicon or Intel)
+- [Homebrew](https://brew.sh)
+- About 600 MB of disk space for the speech model
+- A working microphone
+
+Optional:
+- The [Claude Code CLI](https://docs.claude.com/en/docs/claude-code), already logged in, if
+  you want the AI polish pass. Plain dictation works fully without it.
+
+## Install
+
+```
+git clone <this repo>
+cd scribe
+./install.sh
+```
+
+The installer:
+
+1. Checks you are on macOS and that Homebrew is present (it will not install Homebrew for you).
+2. Installs `whisper-cpp`, `ffmpeg`, and Hammerspoon via Homebrew, skipping anything already present.
+3. Creates `~/.config/scribe/` and copies the app code into it.
+4. Downloads the speech model (about 547 MB) from Hugging Face, resumable if interrupted.
+5. Picks a free port, writes it into `config.json`, and installs the `com.scribe.whisper-server`
+   launchd service so the transcription server starts on login and stays warm.
+6. Wires Scribe into your Hammerspoon config and runs the first-run setup wizard.
+
+It asks for two macOS permissions the first time you use it:
+
+- **Accessibility**, for Hammerspoon, so it can type the transcribed text into other apps.
+- **Microphone**, on your first recording.
+
+Safe to re-run: an upgrade refreshes the app code and the launchd service but never touches
+your config, dictionary, or downloaded model.
+
+## First-run setup
+
+The installer ends by running a short wizard (`scribe_setup.py`), six questions:
+
+1. **Microphone** - picked from a numbered list of what macOS currently sees, stored by name
+   rather than index so it survives a headset or phone connecting later.
+2. **Language** - pin one language code (`en`, `da`, `de`, ...). Auto-detect drifts on accented
+   speech; pinning does not.
+3. **Your words** - names, companies, products, and jargon you say often (boosts accuracy at
+   the transcription stage), plus any fixed corrections you already know you need
+   (`wrong=right`, comma separated).
+4. **Speaker note** - one optional line describing how you speak, used only by the AI polish
+   pass if you turn it on.
+5. **AI polish** - offered only if it finds the Claude CLI on your machine; you choose whether
+   to turn it on.
+6. Writes `config.json` and `dictionary.json` and prints a summary.
+
+Rerun it any time your setup changes:
+
+```
+python3 ~/.config/scribe/app/scribe_setup.py
+```
+
+Answers you already gave are shown as defaults, so a rerun only asks you to confirm or change them.
+
+## Usage
+
+Hold the push-to-talk key (Right Option by default), wait for the cue, speak, release.
+
+1. **Hold** the key. The menu-bar icon shows a warming-up state while the microphone starts.
+2. **Wait for the cue** - a short tone and a "speak" alert. The microphone has a brief cold
+   start; speaking before the cue clips your first word.
+3. **Speak.**
+4. **Release.** The cleaned text pastes at your cursor.
+
+Menu-bar icon states:
+
+| Icon | Meaning |
+|---|---|
+| (plain mic icon) | idle |
+| 🔴 | recording |
+| ⏳ | transcribing |
+| ✨ | polishing (AI cleanup pass) |
+
+Other actions:
+
+- **Recall the last dictation** - `⌘⌥⌃L`. Restores your most recent result (plain or polished)
+  to the clipboard and pastes it, even if you have copied something else since.
+- **Polish the last dictation** - `⌘⌥⌃P`, shown only if you enabled polish in setup. Runs the
+  AI cleanup pass on the dictation you just made, about 10 seconds, without re-recording. Tip:
+  undo the instant paste first, so the polished version replaces it rather than duplicating it.
+- **Streaming mode (beta)** - a checkbox in the menu-bar dropdown, off by default. While you
+  talk, Scribe transcribes at your natural pauses in the background, so only a short tail is
+  left once you release the key. On long dictations this roughly halves the wait. It never
+  cuts mid-speech: if you never pause, it degrades gracefully to the same behavior as the
+  default (batch) mode.
+
+## Configuration
+
+Everything lives in `~/.config/scribe/config.json`. Edit it directly, or rerun the setup
+wizard.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `language` | string | `"en"` | Transcription language code. Pinned, not auto-detected. |
+| `mic_name` | string | `""` | Microphone, matched by name so it survives device changes. |
+| `hotkey_keycode` | number | `61` | Push-to-talk key. See common values below. |
+| `hotkey_flag` | string | `"alt"` | The modifier flag that keycode raises (`alt`, `ctrl`, `cmd`, `shift`). |
+| `server_port` | number | `8090` | Port the local whisper-server listens on (localhost only). |
+| `model_file` | string | `"ggml-large-v3-turbo-q5_0.bin"` | Speech model filename, inside `~/.config/scribe/models/`. |
+| `vocabulary` | list of strings | `[]` | Names and terms boosted at transcription time. |
+| `speaker_note` | string | `""` | One line of speaker context, used only by the AI polish prompt. |
+| `mode` | `"dict"` or `"full"` | `"dict"` | Default pipeline: dictionary-only, or with AI polish. |
+| `polish_enabled` | boolean | `false` | Turns on the AI polish hotkey and menu item. |
+| `claude_bin` | string | `"~/.local/bin/claude"` | Path to the Claude CLI. |
+| `claude_model` | string | `"claude-haiku-4-5-20251001"` | Model used for the polish pass. |
+
+Common `hotkey_keycode` / `hotkey_flag` pairs (macOS virtual keycodes):
+
+| Key | `hotkey_keycode` | `hotkey_flag` |
+|---|---|---|
+| Right Option (default) | `61` | `"alt"` |
+| Left Option | `58` | `"alt"` |
+| Right Control | `62` | `"ctrl"` |
+
+`dictionary.json` holds deterministic, case-insensitive, word-boundary replacements applied to
+every transcript:
+
+```json
+{
+  "replacements": {
+    "Akme Korp": "Acme Corp"
+  }
+}
+```
+
+Use it only for garbles that are never a legitimate word on their own; anything ambiguous
+(a word that could be either the garble or something you actually meant) belongs in the
+optional AI polish pass instead, which has context the dictionary does not.
+
+File locations:
+
+| Path | Contents |
+|---|---|
+| `~/.config/scribe/config.json` | Settings, above |
+| `~/.config/scribe/dictionary.json` | Replacement rules |
+| `~/.config/scribe/models/` | The downloaded speech model |
+| `~/.config/scribe/app/` | Installed app code (`pipeline.py`, `stream_worker.py`, `dictate.lua`, `scribe_setup.py`) |
+| `~/.config/scribe/state/` | Recording, transcript, and server log files (see Privacy, below) |
+
+## How it works
+
+```
+  hold hotkey
+      |
+      v
+  [ ffmpeg ]  --records the configured mic-->  16kHz mono audio
+      |
+      v
+  [ whisper-server ]   (warm, launchd, bound to 127.0.0.1 only)
+      |  raw transcript
+      v
+  [ dictionary.json ]  --deterministic word-boundary fixes-->
+      |
+      v
+  [ loop collapser ]   --removes transcriber stutter repeats-->
+      |
+      v
+  (optional, opt-in)
+  [ claude -p polish ] --context homophones, grammar, your own Claude CLI-->
+      |
+      v
+  clipboard + paste at cursor
+```
+
+Streaming mode runs the same stages, but hands off finished stretches of speech to the warm
+server while you are still talking, cutting only at real pauses, so release only has a short
+tail left to transcribe.
+
+## Privacy and data processing
+
+**Audio.** Captured from the microphone you selected, written to a local file under
+`~/.config/scribe/state/`, sent to a whisper.cpp server bound to `127.0.0.1` (localhost only,
+never reachable over the network), then deleted or overwritten on your next dictation. Audio
+never leaves the machine.
+
+**Text.** Transcripts are written to local state files and the macOS clipboard. Nothing is
+sent anywhere by default.
+
+**The one optional network flow of dictated content.** If you enable the AI polish pass, the
+*text* of a dictation (never the audio) is sent to Anthropic's Claude through your own,
+locally installed Claude CLI, under your own account and subject to its own terms. It is off
+by default, opt-in during setup, and only runs when you invoke it.
+
+**Other network traffic.** A one-time model download from Hugging Face at install time, and
+Homebrew package installs. No telemetry, no analytics, no accounts, no update phone-home.
+Scribe operates no servers of its own.
+
+### GDPR, in plain language
+
+This is informational, not legal advice.
+
+Because all core processing happens on-device, using Scribe does not by itself transmit
+personal data to the Scribe project or to any third party. The project's maintainers never
+see your data and operate no processing infrastructure, so normal use does not create a
+controller/processor relationship with the project.
+
+Purely personal or household use falls outside the GDPR's material scope in any case (the
+household exemption, Art. 2(2)(c)).
+
+For professional or organizational use, your organization remains the controller of whatever
+content you dictate, which may include personal data of third parties (a colleague's name in
+a note, for instance). Keeping the processing local generally simplifies that assessment:
+there is no third-country transfer and no new processor to account for, since the data never
+leaves a device your organization already governs.
+
+If you enable the optional AI polish in a professional context, the dictated text goes to
+Anthropic under your own agreement with Anthropic. Treat that flow the way you would treat any
+other use of your Claude subscription, under Anthropic's own commercial terms as between you
+and Anthropic, and check your organization's position before enabling it if you regularly
+dictate other people's personal data.
+
+Everything Scribe writes lives under `~/.config/scribe/` (config, dictionary, model, and the
+state/transcript files described above), so a DPO-minded reviewer can inspect all of it
+directly. The uninstaller removes it on request (see Uninstall, below).
+
+## Troubleshooting
+
+**Server not up.**
+```
+launchctl list | grep com.scribe.whisper-server        # want a real PID
+launchctl unload ~/Library/LaunchAgents/com.scribe.whisper-server.plist
+launchctl load -w ~/Library/LaunchAgents/com.scribe.whisper-server.plist
+tail -f ~/.config/scribe/state/whisper-server.err
+tail -f ~/.config/scribe/state/whisper-server.log
+```
+
+**Nothing pastes.** Check System Settings > Privacy & Security > Accessibility. Hammerspoon
+must be enabled there, and its own window must not still show a "not enabled" warning; if it
+does, toggle the entry off and back on and reload Hammerspoon.
+
+**Wrong microphone, or no audio.** Rerun the setup wizard and pick the microphone again:
+```
+python3 ~/.config/scribe/app/scribe_setup.py
+```
+
+**A note on iPhone Continuity.** Scribe resolves its microphone by name, on purpose, rather
+than by device index. The index macOS assigns can silently become your iPhone's Continuity
+microphone when it is nearby; matching by name keeps Scribe on the mic you actually configured.
+
+## Uninstall
+
+```
+bash uninstall.sh
+```
+
+This always removes the launchd service and the Hammerspoon loader block. It asks before
+deleting `~/.config/scribe` (your config, dictionary, and the speech model). It never touches
+the Homebrew packages themselves; the script prints the commands to remove those yourself if
+you want to.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

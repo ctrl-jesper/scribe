@@ -1,0 +1,6 @@
+{
+  "_comment": "Deterministic, case-insensitive, word-boundary replacements applied to every transcript. Put ONLY unambiguous garbles here, never a spelling that is also a legitimate word in your own speech: the replacement has no context to fall back on. Ambiguous fixes belong to the optional LLM polish pass instead.",
+  "replacements": {
+    "Acme Korp": "Acme Corp"
+  }
+}

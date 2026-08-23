@@ -1,0 +1,14 @@
+{
+  "language": "en",
+  "mic_name": "MacBook Air Microphone",
+  "hotkey_keycode": 61,
+  "hotkey_flag": "alt",
+  "server_port": 8090,
+  "model_file": "ggml-large-v3-turbo-q5_0.bin",
+  "vocabulary": ["Acme Corp", "Kubernetes", "Postgres"],
+  "speaker_note": "",
+  "mode": "dict",
+  "polish_enabled": false,
+  "claude_bin": "~/.local/bin/claude",
+  "claude_model": "claude-haiku-4-5-20251001"
+}
