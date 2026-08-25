@@ -1,6 +1,7 @@
 {
+  "config_version": 1,
   "language": "en",
-  "mic_name": "MacBook Air Microphone",
+  "mic_name": "",
   "hotkey_keycode": 61,
   "hotkey_flag": "alt",
   "server_port": 8090,
@@ -10,5 +11,7 @@
   "mode": "dict",
   "polish_enabled": false,
   "claude_bin": "~/.local/bin/claude",
-  "claude_model": "claude-haiku-4-5-20251001"
+  "claude_model": "claude-haiku-4-5-20251001",
+  "ffmpeg_bin": "",
+  "python_bin": ""
 }

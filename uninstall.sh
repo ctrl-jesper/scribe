@@ -19,6 +19,12 @@ HS_END="-- END scribe"
 step() { printf '\n==> %s\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
 
+installed_version=""
+[ -f "$CONFIG_HOME/VERSION" ] && installed_version="$(tr -d '[:space:]' <"$CONFIG_HOME/VERSION" 2>/dev/null || true)"
+if [ -n "$installed_version" ]; then
+    info "removing Scribe $installed_version"
+fi
+
 # ---------------------------------------------------------------------------
 # 1. launchd service
 # ---------------------------------------------------------------------------
@@ -39,13 +45,27 @@ fi
 # ---------------------------------------------------------------------------
 
 step "Removing the Hammerspoon loader block"
-if [ -f "$HS_INIT" ] && grep -q -- "$HS_BEGIN" "$HS_INIT"; then
+# Whole-line equality, never "contains": a file that merely mentions the marker
+# string in a comment must not lose everything after that line.
+if [ -e "$HS_INIT" ] && grep -qxF -- "$HS_BEGIN" "$HS_INIT"; then
+    # A dotfiles repo often symlinks init.lua. Edit what the link points at, so
+    # the link survives instead of being replaced by a regular file.
+    HS_TARGET="$HS_INIT"
+    if [ -L "$HS_INIT" ]; then
+        HS_TARGET="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$HS_INIT")"
+        info "$HS_INIT is a symlink; editing $HS_TARGET and leaving the link alone"
+    fi
+
+    backup="$HS_TARGET.scribe-backup-$(date +%Y%m%d-%H%M%S)"
+    cp "$HS_TARGET" "$backup"
+    info "backed up your init.lua to $backup"
+
     awk -v b="$HS_BEGIN" -v e="$HS_END" '
-        index($0, b) { skip = 1 }
-        !skip        { print }
-        index($0, e) { skip = 0 }
-    ' "$HS_INIT" >"$HS_INIT.scribe-tmp"
-    mv "$HS_INIT.scribe-tmp" "$HS_INIT"
+        $0 == b { skip = 1; next }
+        $0 == e { skip = 0; next }
+        !skip   { print }
+    ' "$HS_TARGET" >"$HS_TARGET.scribe-tmp"
+    mv "$HS_TARGET.scribe-tmp" "$HS_TARGET"
     info "removed the marked block from $HS_INIT"
     info "reload Hammerspoon (menu-bar icon > Reload config) to drop the hotkey"
 else
@@ -59,7 +79,7 @@ fi
 step "User data"
 if [ -d "$CONFIG_HOME" ]; then
     size="$(du -sh "$CONFIG_HOME" 2>/dev/null | cut -f1 || echo "unknown size")"
-    info "$CONFIG_HOME holds your config, your dictionary, and the speech model ($size)."
+    info "$CONFIG_HOME holds your config, your dictionary, your recordings, and the speech model ($size)."
     printf '    Delete it? [y/N] '
     if [ -t 0 ]; then
         read -r answer
@@ -87,6 +107,9 @@ fi
 cat <<'CLOSING'
 
 ==> Scribe is uninstalled.
+
+  Your init.lua was backed up before it was edited; the backup sits next to it
+  with a .scribe-backup-<timestamp> suffix. Delete it once you are happy.
 
   Homebrew packages were left alone, because other tools may use them.
   Remove them yourself if you no longer need them:

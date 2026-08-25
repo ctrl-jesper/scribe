@@ -2,6 +2,34 @@
 
 All notable changes to Scribe are documented in this file.
 
+## [0.1.1] - 2026-08-25
+
+### Fixed
+
+- A bug that could paste a previous dictation instead of the one you just made.
+- A microphone-selection bug that could record from the wrong device.
+- Intel Mac support, which was broken by paths hardcoded to the Apple Silicon Homebrew
+  location.
+- Hardened the installer and the handling of `config.json` and `dictionary.json`.
+
+### Documentation
+
+- Requirements now note that Intel support is implemented but not yet verified on Intel
+  hardware.
+- Rewrote the Privacy section's audio and text retention claims to match what the code
+  actually does: batch-mode audio is overwritten, not deleted, on the next batch dictation,
+  and can persist indefinitely if you switch to streaming mode; streaming chunk files are
+  kept on disk when a chunk fails to transcribe twice; and the `last-dict.txt` and
+  `last-output.txt` transcript files are never deleted automatically.
+- Replaced the "roughly halves the wait" streaming claim with the maintainer's actual,
+  single-test measurement, and noted that streaming has no effect below about 22 seconds of
+  speech.
+- Marked `model_file` in the configuration table as fixed at install time rather than a
+  live setting.
+- Added a "Known limitations" section covering the unauthenticated local transcription
+  server, config files as trusted input, and the scope of the Accessibility permission
+  Scribe inherits through Hammerspoon.
+
 ## [0.1.0] - 2026-08-23
 
 Initial public release.

@@ -29,8 +29,17 @@ CONFIG_PATH = os.path.join(CONFIG_HOME, "config.json")
 DICTIONARY_PATH = os.path.join(CONFIG_HOME, "dictionary.json")
 APP_DIR = os.path.join(CONFIG_HOME, "app")
 
+# Schema version of config.json. Bump it, and add a migration, when the meaning
+# of an existing key changes. Version 1 is the first numbered schema; a file
+# without the key was written before numbering started and is compatible as-is.
+CONFIG_VERSION = 1
+
 DEFAULT_CONFIG = {
+    "config_version": CONFIG_VERSION,
     "language": "en",
+    # Deliberately empty. Naming any particular Mac's microphone here would be
+    # wrong on every other machine, and dictate.lua refuses to record (and says
+    # so) rather than guessing a device index.
     "mic_name": "",
     "hotkey_keycode": 61,
     "hotkey_flag": "alt",
@@ -42,7 +51,16 @@ DEFAULT_CONFIG = {
     "polish_enabled": False,
     "claude_bin": "~/.local/bin/claude",
     "claude_model": "claude-haiku-4-5-20251001",
+    # Absolute paths resolved by install.sh: Homebrew is /opt/homebrew on Apple
+    # Silicon and /usr/local on Intel, and the working python3 is not always
+    # /usr/bin/python3. Empty means "let dictate.lua fall back".
+    "ffmpeg_bin": "",
+    "python_bin": "",
 }
+
+# An input whose loudest sample sits below this is almost certainly not hearing
+# you: a muted device, or the wrong one.
+SILENCE_DBFS = -50.0
 
 # Names that usually mean the microphone built into the Mac itself, which is
 # the right default: it never disappears the way a phone or headset does.
@@ -168,7 +186,21 @@ def merge_config(existing: Dict, answers: Dict) -> Dict:
     merged = dict(DEFAULT_CONFIG)
     merged.update(existing or {})
     merged.update(answers or {})
+    merged["config_version"] = CONFIG_VERSION
     return merged
+
+
+def parse_max_volume(output: str) -> Optional[float]:
+    """Return the max_volume in dBFS that ffmpeg's volumedetect filter reported.
+
+    The line looks like:
+        [Parsed_volumedetect_0 @ 0x7f8] max_volume: -13.4 dB
+    None means ffmpeg never reported one, which is not the same as silence.
+    """
+    match = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", output)
+    if match:
+        return float(match.group(1))
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -226,11 +258,23 @@ def server_reachable(port: int) -> bool:
         return False
 
 
-def list_devices_output() -> str:
+def ffmpeg_binary(config: Dict) -> str:
+    """Absolute ffmpeg path from config.json, else whatever is on PATH.
+
+    install.sh writes ffmpeg_bin because the Homebrew prefix differs between
+    Apple Silicon (/opt/homebrew) and Intel (/usr/local).
+    """
+    configured = str(config.get("ffmpeg_bin", "") or "").strip()
+    if configured and os.path.isfile(configured) and os.access(configured, os.X_OK):
+        return configured
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+def list_devices_output(ffmpeg: str = "ffmpeg") -> str:
     """Ask ffmpeg for the device list. It always exits non-zero here."""
     try:
         result = subprocess.run(
-            ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+            [ffmpeg, "-f", "avfoundation", "-list_devices", "true", "-i", ""],
             stdin=subprocess.DEVNULL,  # ffmpeg reads stdin for commands; keep it off ours
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -243,6 +287,35 @@ def list_devices_output() -> str:
         print("  ffmpeg did not answer within 20 seconds.")
         return ""
     return result.stdout.decode("utf-8", "replace")
+
+
+def probe_microphone(ffmpeg: str, index: int, seconds: int = 2) -> Optional[float]:
+    """Record briefly from one avfoundation input and return its peak in dBFS.
+
+    None means the level could not be measured at all (ffmpeg missing, the
+    device refused to open, macOS has not granted microphone access yet). That
+    is reported as "could not check", never as a failure: this whole step is a
+    convenience, and a wrong answer here must not block setup.
+    """
+    try:
+        result = subprocess.run(
+            [
+                ffmpeg, "-hide_banner", "-nostdin",
+                "-f", "avfoundation", "-i", ":%d" % index,
+                "-t", str(seconds),
+                "-af", "volumedetect",
+                "-f", "null", "-",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=seconds + 20,
+        )
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        return None
+    return parse_max_volume(result.stdout.decode("utf-8", "replace"))
 
 
 def find_claude_bin(configured: str) -> Optional[str]:
@@ -306,6 +379,49 @@ def ask_device(devices: Sequence[Tuple[int, str]], previous_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def check_microphone(
+    ffmpeg: str, devices: Sequence[Tuple[int, str]], chosen_name: str
+) -> None:
+    """Record two seconds from the chosen mic and report the peak level.
+
+    Skippable and never fatal: it either reassures the user that the device they
+    picked can hear them, or warns that it cannot, and setup continues either
+    way.
+    """
+    index = None
+    for device_index, name in devices:
+        if name == chosen_name:
+            index = device_index
+            break
+    if index is None:
+        return
+
+    print("\nMICROPHONE CHECK (optional)")
+    print("   Records 2 seconds from '%s' and reports how loud it was." % chosen_name)
+    print("   The first run may ask macOS for microphone access for your terminal.")
+    if not ask_yes_no("  Run the check now (say something while it records)", True):
+        print("   Skipped.")
+        return
+
+    print("   Recording 2 seconds, speak now ...")
+    try:
+        peak = probe_microphone(ffmpeg, index)
+    except Exception as error:  # a convenience check must not break setup
+        print("   Could not run the check (%s). Skipping it." % error)
+        return
+
+    if peak is None:
+        print("   Could not measure a level. That usually means macOS has not")
+        print("   granted microphone access yet, or the device is in use. Not a")
+        print("   problem for setup: grant access when Scribe first records.")
+    elif peak <= SILENCE_DBFS:
+        print("   WARNING: peak level %.1f dBFS, which is effectively silence." % peak)
+        print("   '%s' may be muted, or may not be the device you speak into." % chosen_name)
+        print("   Rerun this wizard and pick a different one if dictation comes back empty.")
+    else:
+        print("   Peak level %.1f dBFS. That microphone is hearing you." % peak)
+
+
 def run_wizard() -> int:
     config = load_json(CONFIG_PATH, DEFAULT_CONFIG)
     dictionary = load_json(DICTIONARY_PATH, {"replacements": {}})
@@ -317,7 +433,8 @@ def run_wizard() -> int:
     print()
     print("Scribe setup")
     print("Scribe turns held-key speech into typed text, entirely on this Mac.")
-    print("Six short questions. Press Return to keep the value in [brackets].")
+    print("Six short questions, then an optional microphone check.")
+    print("Press Return to keep the value in [brackets].")
 
     port = int(config.get("server_port", DEFAULT_CONFIG["server_port"]))
     if server_reachable(port):
@@ -330,7 +447,8 @@ def run_wizard() -> int:
     print("\n1. MICROPHONE")
     print("   Scribe stores the microphone by name, so it still works after you")
     print("   plug in a headset or your phone offers itself as a camera.")
-    devices = parse_audio_devices(list_devices_output())
+    ffmpeg = ffmpeg_binary(config)
+    devices = parse_audio_devices(list_devices_output(ffmpeg))
     previous_mic = str(config.get("mic_name", "") or "")
     if devices:
         answers["mic_name"] = ask_device(devices, previous_mic)
@@ -394,6 +512,11 @@ def run_wizard() -> int:
         print("   unaffected. To enable it later, install the Claude CLI and run")
         print("   this wizard again.")
         answers["polish_enabled"] = False
+
+    # Microphone check --------------------------------------------------------
+    # Catches the wrong-mic case here rather than after a dictation comes back
+    # empty. Optional, and never fatal.
+    check_microphone(ffmpeg, devices, str(answers.get("mic_name", "") or ""))
 
     # 6. Write ----------------------------------------------------------------
     final_config = merge_config(config, answers)
@@ -527,6 +650,28 @@ def run_selftest() -> int:
     assert config["hotkey_keycode"] == 61, "defaults fill the gaps"
     assert config["polish_enabled"] is True
     assert set(DEFAULT_CONFIG).issubset(set(config)), "every contract key present"
+    checks += 5
+
+    assert DEFAULT_CONFIG["mic_name"] == "", "no machine-specific microphone as a default"
+    assert config["config_version"] == CONFIG_VERSION, "the schema version is stamped"
+    stamped = merge_config({"config_version": 0}, {})
+    assert stamped["config_version"] == CONFIG_VERSION, "an older file is restamped"
+    assert "ffmpeg_bin" in DEFAULT_CONFIG and "python_bin" in DEFAULT_CONFIG
+    # install.sh writes the real paths; the defaults must not overwrite them.
+    kept = merge_config({"ffmpeg_bin": "/usr/local/bin/ffmpeg"}, {})
+    assert kept["ffmpeg_bin"] == "/usr/local/bin/ffmpeg", "resolved paths survive a rerun"
+    checks += 5
+
+    volumedetect = (
+        "[Parsed_volumedetect_0 @ 0x7f8] n_samples: 32000\n"
+        "[Parsed_volumedetect_0 @ 0x7f8] mean_volume: -31.2 dB\n"
+        "[Parsed_volumedetect_0 @ 0x7f8] max_volume: -13.4 dB\n"
+    )
+    assert parse_max_volume(volumedetect) == -13.4, parse_max_volume(volumedetect)
+    assert parse_max_volume("max_volume: 0.0 dB") == 0.0
+    assert parse_max_volume("nothing useful here") is None
+    assert parse_max_volume("") is None
+    assert -91.0 <= SILENCE_DBFS <= 0.0, "the silence threshold has to be a dBFS value"
     checks += 5
 
     with tempfile.TemporaryDirectory() as directory:

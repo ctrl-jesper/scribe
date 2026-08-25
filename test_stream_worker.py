@@ -368,6 +368,44 @@ _ok.finish()
 check("chunks come back in submission order", _ok.texts_in_order(2), ["chunk one.wav", "chunk two.wav"])
 
 
+# --- 6b. clipboard, empty transcripts, logging, and the ffmpeg binary ---------------------
+# A failed pbcopy must be reported, not swallowed: dictate.lua pastes on exit 0, so a stale
+# clipboard would paste the PREVIOUS dictation. subprocess.run is stubbed rather than calling
+# the real pbcopy, so running these tests never touches anyone's clipboard.
+_copied = []
+_saved_copy = sw.pipeline.copy_to_clipboard
+sw.pipeline.copy_to_clipboard = lambda text: (_copied.append(text), False)[1]
+_stdout, sys.stdout = sys.stdout, io.StringIO()
+_copy_failed = sw.emit("words", copy=True)
+sys.stdout = _stdout
+sw.pipeline.copy_to_clipboard = _saved_copy
+check("emit hands the text to pipeline's clipboard helper", _copied, ["words"])
+check("emit reports a failed clipboard copy", _copy_failed, False)
+
+# whisper returns "[BLANK_AUDIO]" for silence, not "": the streaming worker must treat that
+# as nothing-was-said (exit 3) rather than pasting the marker.
+check("a merged transcript of only non-speech markers counts as empty",
+      p.is_effectively_empty(sw.finalize_text(["[BLANK_AUDIO]", "[BLANK_AUDIO]"], {})), True)
+check("a merged transcript with words does not",
+      p.is_effectively_empty(sw.finalize_text(["[BLANK_AUDIO]", "but I spoke"], {})), False)
+
+check("stream_worker logs through pipeline's helper rather than its own",
+      sw.log is sw.pipeline.log, True)
+
+check("ffmpeg binary comes from config when given",
+      sw.live_ffmpeg_args("3", "/tmp/x.pcm", "/usr/local/bin/ffmpeg")[0], "/usr/local/bin/ffmpeg")
+check("file mode takes the configured ffmpeg too",
+      sw.file_ffmpeg_args("/tmp/a.wav", "/tmp/o.pcm", "/usr/local/bin/ffmpeg")[0],
+      "/usr/local/bin/ffmpeg")
+check("the fallback ffmpeg path is absolute", os.path.isabs(sw.FFMPEG), True)
+
+# --language reaches a curl form field, so it gets the same rule as config.json.
+_stderr, sys.stderr = sys.stderr, io.StringIO()
+check_raises("a --language carrying curl's @ sigil is refused", SystemExit,
+             sw.main, ["--from-file", os.path.join(FIXTURES, "hdr.wav"), "--language", "@/tmp/x"])
+sys.stderr = _stderr
+
+
 # --- 7. integration: file mode must match the batch path exactly -------------------------
 # Version-independent path: the opt/ symlink whisper-cpp maintains, unlike the Cellar path,
 # does not change on a Homebrew version bump.
@@ -379,7 +417,10 @@ elif not _port_answers(TEST_PORT):
     skips.append("integration: whisper-server not answering on 127.0.0.1:%d" % TEST_PORT)
 else:
     cfg = p.load_config()
-    batch = p.run(JFK, "dict", cfg)
+    # max_age=None: jfk.wav is a sample shipped with whisper-cpp, so it is legitimately old.
+    # The staleness guard exists for the recorder's own state/dictation.wav, not for a file
+    # named explicitly.
+    batch = p.run(JFK, "dict", cfg, max_age=None)
     stream = subprocess.run([sys.executable, os.path.join(HERE, "stream_worker.py"),
                              "--from-file", JFK], capture_output=True, text=True, timeout=180,
                             env=dict(os.environ, SCRIBE_HOME=SCRIBE_HOME))

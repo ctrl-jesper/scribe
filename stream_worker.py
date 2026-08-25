@@ -25,15 +25,21 @@ Two measured facts shape every decision here:
 
 Exit codes: 0 success (text on stdout and, with --copy, on the clipboard), 3 nothing was
 captured (dictate.lua treats this as an aborted dictation: no paste, no error), 1 failure.
+
+Every run appends timestamped lines to the shared Scribe log (pipeline.log).
 """
-import argparse, os, queue, re, signal, struct, subprocess, sys, threading, time
+import argparse, os, queue, re, shutil, signal, struct, subprocess, sys, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import pipeline
 
-FFMPEG = "/opt/homebrew/bin/ffmpeg"
+from pipeline import log
+
+# Fallback only. The real path comes from config.json's "ffmpeg_bin", which install.sh writes;
+# resolving from PATH here keeps an Intel Mac (/usr/local/bin) working without a config file.
+FFMPEG = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
 
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2                       # mono s16le
@@ -187,12 +193,14 @@ def transcribe_with_retry(transcribe_fn, wav_path, cfg, attempts=2):
     the user actually said.
     """
     last = None
-    for _attempt in range(attempts):
+    for attempt in range(attempts):
         try:
             return transcribe_fn(wav_path, cfg["server_url"], cfg.get("language", "en"),
                                  cfg.get("prompt", ""))
         except Exception as exc:            # any failure is worth one retry
             last = exc
+            log("chunk transcription attempt %d/%d failed for %s: %s"
+                % (attempt + 1, attempts, wav_path, exc))
     raise ChunkTranscriptionError(wav_path, last)
 
 
@@ -318,10 +326,7 @@ def emit(text, copy=False):
     sys.stdout.write(text + "\n")
     sys.stdout.flush()
     if copy:
-        done = subprocess.run(["pbcopy"], input=text, text=True)
-        if done.returncode != 0:
-            sys.stderr.write("pbcopy failed (rc=%d); clipboard not updated\n" % done.returncode)
-            return False
+        return pipeline.copy_to_clipboard(text)
     return True
 
 
@@ -347,21 +352,21 @@ def stop_exit_code(mic_ready, pcm_bytes):
 PCM_OUT_ARGS = ["-c:a", "pcm_s16le", "-flush_packets", "1", "-f", "s16le"]
 
 
-def live_ffmpeg_args(mic_index, path=None):
+def live_ffmpeg_args(mic_index, path=None, ffmpeg_bin=None):
     """One process, two output legs: raw PCM to disk, silencedetect to stderr."""
     path = pcm_path() if path is None else path
-    return ([FFMPEG, "-hide_banner", "-y",
+    return ([ffmpeg_bin or FFMPEG, "-hide_banner", "-y",
              "-f", "avfoundation", "-i", ":%s" % mic_index,
              "-ar", str(SAMPLE_RATE), "-ac", "1", "-map", "0:a"] + PCM_OUT_ARGS +
             [path, "-map", "0:a", "-af", SILENCE_FILTER, "-f", "null", "-"])
 
 
-def file_ffmpeg_args(src, path):
+def file_ffmpeg_args(src, path, ffmpeg_bin=None):
     """Same two legs, reading a file instead of the microphone."""
     src_args = ["-i", src]
     if src.endswith(".pcm"):                # headerless: tell ffmpeg what it is looking at
         src_args = ["-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", src]
-    return ([FFMPEG, "-hide_banner", "-y"] + src_args +
+    return ([ffmpeg_bin or FFMPEG, "-hide_banner", "-y"] + src_args +
             ["-ar", str(SAMPLE_RATE), "-ac", "1", "-map", "0:a"] + PCM_OUT_ARGS +
             [path, "-map", "0:a", "-af", SILENCE_FILTER, "-f", "null", "-"])
 
@@ -435,7 +440,8 @@ def run_live(mic_index, cfg, copy=False, timings=False):
     live_pcm = pcm_path()
     _quiet_remove(live_pcm)
     t_start = time.time()
-    proc = subprocess.Popen(live_ffmpeg_args(mic_index, live_pcm), stdout=subprocess.DEVNULL,
+    proc = subprocess.Popen(live_ffmpeg_args(mic_index, live_pcm, cfg.get("ffmpeg_bin")),
+                            stdout=subprocess.DEVNULL,
                             stderr=subprocess.PIPE, bufsize=0, start_new_session=True)
     parser = SilenceParser()
     pump = StderrPump(proc.stderr, parser)
@@ -455,6 +461,8 @@ def run_live(mic_index, cfg, copy=False, timings=False):
             sys.stdout.flush()
         if proc.poll() is not None:
             _stop_ffmpeg(proc)
+            log("ffmpeg exited early (rc=%s) on mic %s: %s"
+                % (proc.returncode, mic_index, pump.tail_text()[-400:]))
             sys.stderr.write("ffmpeg exited early (rc=%s) while recording from mic %s:\n%s\n"
                              % (proc.returncode, mic_index, pump.tail_text()))
             return EXIT_FAIL
@@ -473,6 +481,8 @@ def run_live(mic_index, cfg, copy=False, timings=False):
 
     code = stop_exit_code(mic_ready, _file_size(live_pcm))
     if code != 0:
+        log("nothing captured (mic_ready=%s, bytes=%d); exiting %d"
+            % (mic_ready, _file_size(live_pcm), code))
         return code
 
     # Claim the recording under our own name before any new worker can clear the live path.
@@ -521,10 +531,11 @@ def run_file(src, cfg, copy=False, timings=False):
 
     path = os.path.join(chunk_dir(), "stream-file-%d.pcm" % os.getpid())
     t_start = time.time()
-    proc = subprocess.run(file_ffmpeg_args(src, path), stdout=subprocess.DEVNULL,
-                          stderr=subprocess.PIPE)
+    proc = subprocess.run(file_ffmpeg_args(src, path, cfg.get("ffmpeg_bin")),
+                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     stderr = proc.stderr.decode("utf-8", "replace")
     if proc.returncode != 0:
+        log("ffmpeg failed to decode %s (rc=%d): %s" % (src, proc.returncode, stderr[-400:]))
         sys.stderr.write("ffmpeg failed to decode %s (rc=%d):\n%s\n"
                          % (src, proc.returncode, stderr[-2000:]))
         return EXIT_FAIL
@@ -535,6 +546,7 @@ def run_file(src, cfg, copy=False, timings=False):
 
     total = _file_size(path) / float(BYTES_PER_SECOND)
     if total <= 0:
+        log("no audio decoded from %s; exiting %d" % (src, EXIT_EMPTY))
         sys.stderr.write("no audio decoded from %s\n" % src)
         return EXIT_EMPTY
 
@@ -564,14 +576,18 @@ def run_file(src, cfg, copy=False, timings=False):
 def _finish(session, transcriber, cfg, copy, timings, t_release, extra):
     transcriber.finish()
     if transcriber.error is not None:
+        log("FAIL %s (audio kept at %s)" % (transcriber.error, transcriber.error.wav_path))
         sys.stderr.write("%s\nAudio kept for recovery: %s\n"
                          % (transcriber.error, transcriber.error.wav_path))
         return EXIT_FAIL
 
     text = finalize_text(transcriber.texts_in_order(session.chunk_count),
                          pipeline.load_replacements())
-    if not text:
-        return EXIT_EMPTY                   # nothing was said; dictate.lua resets quietly
+    if pipeline.is_effectively_empty(text):
+        # Nothing was said (or whisper returned only [BLANK_AUDIO]); dictate.lua resets
+        # quietly. Exiting 0 here would paste the previous clipboard contents.
+        log("EMPTY: nothing transcribed from %d chunk(s)" % session.chunk_count)
+        return EXIT_EMPTY
 
     copied = emit(text, copy=copy)
     if timings:
@@ -580,7 +596,9 @@ def _finish(session, transcriber, cfg, copy, timings, t_release, extra):
         parts.append("cuts=[%s]" % ", ".join("%.1f-%.1f" % c for c in session.cuts))
         parts.append("release_wait=%.2fs" % (time.time() - t_release))
         sys.stderr.write("timings: " + ", ".join(parts) + "\n")
-    return 0 if copied else EXIT_FAIL
+    if not copied:
+        return EXIT_FAIL                    # clipboard is stale; the caller must not paste
+    return 0
 
 
 def main(argv=None):
@@ -595,12 +613,27 @@ def main(argv=None):
     if bool(args.mic) == bool(args.from_file):
         ap.error("give exactly one of --mic or --from-file")
 
-    cfg = pipeline.load_config()
+    started = time.time()
+    mode = "file" if args.from_file else "live"
+    try:
+        cfg = pipeline.load_config()
+    except RuntimeError as exc:
+        log("FAIL mode=%s: %s" % (mode, exc))
+        sys.stderr.write("scribe: %s\n" % exc)
+        return EXIT_FAIL
     if args.language:
+        # Same rule as config.json: the value reaches a curl form field, so it may not carry
+        # curl's @ / < sigils.
+        if not pipeline.is_valid_language(args.language):
+            ap.error('--language must be a 2-3 letter code such as "en" or "da", or "auto"')
         cfg["language"] = args.language
+    log("start mode=%s source=%s" % (mode, args.from_file or args.mic))
     if args.from_file:
-        return run_file(args.from_file, cfg, copy=args.copy, timings=args.timings)
-    return run_live(args.mic, cfg, copy=args.copy, timings=args.timings)
+        code = run_file(args.from_file, cfg, copy=args.copy, timings=args.timings)
+    else:
+        code = run_live(args.mic, cfg, copy=args.copy, timings=args.timings)
+    log("end mode=%s exit=%d %.2fs" % (mode, code, time.time() - started))
+    return code
 
 
 if __name__ == "__main__":
