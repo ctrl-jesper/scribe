@@ -2,6 +2,33 @@
 
 All notable changes to Scribe are documented in this file.
 
+## [0.2.0] - 2026-08-26
+
+### Added
+
+- A live heads-up display: while you hold the key, a small borderless dark pill shows three
+  bars that react to your actual voice, one per frequency band (bass, mid, treble), smoothed
+  like an audio meter (fast attack, slow release). If the bars move, the right microphone is
+  live, which also makes wrong-mic problems visible immediately.
+- On release the bars morph into three dots that bounce in sequence while Scribe transcribes,
+  then the pill fades as the text pastes.
+- The menu-bar icon is redrawn in the same visual family and now reflects real state: still
+  dots when idle, live level bars while recording, a dot cycle while transcribing.
+- Streaming mode's worker now measures the three frequency bands during recording and streams
+  the levels to the display, so both modes show a live meter.
+
+### Changed
+
+- The "speak" and "transcribing" text alerts are replaced by the display above. Error alerts
+  are unchanged.
+
+### Fixed
+
+- A level reading arriving in the same instant as key release can no longer disturb the
+  release animation.
+- A partial line of process output without a newline is no longer discarded (affected the
+  level meter only).
+
 ## [0.1.1] - 2026-08-25
 
 ### Fixed

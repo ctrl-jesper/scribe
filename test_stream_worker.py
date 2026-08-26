@@ -171,8 +171,19 @@ check("write_wav length = 44 + payload", os.path.getsize(_wav), 44 + 200)
 _live = sw.live_ffmpeg_args("3", "/tmp/x.pcm")
 check("live ffmpeg records the named avfoundation device",
       _live[_live.index("-i") + 1], ":3")
-check("live ffmpeg has both output legs (pcm file + null silencedetect)",
-      (_live.count("-map"), _live[-5:]), (2, ["-af", sw.SILENCE_FILTER, "-f", "null", "-"]))
+check("live ffmpeg has all five output legs (pcm, silencedetect, three band meters)",
+      (_live.count("-map"), _live.count("-f")),
+      (5, 6))   # -f avfoundation (input) + -f s16le (pcm leg) + four -f null legs
+check("live ffmpeg's silencedetect leg is intact",
+      _live[_live.index("-af"):_live.index("-af") + 5],
+      ["-af", sw.SILENCE_FILTER, "-f", "null", "-"])
+check("live ffmpeg maps the three tagged band legs",
+      [a for a in _live if a.startswith("[o")], ["[olo]", "[omi]", "[ohi]"])
+check("live ffmpeg's band graph is the file-verified one",
+      _live[_live.index("-filter_complex") + 1], sw.BAND_FILTER)
+check("file mode gets no band legs (no live HUD to feed)",
+      ("-filter_complex" in sw.file_ffmpeg_args("/tmp/a.wav", "/tmp/o.pcm"),
+       sw.file_ffmpeg_args("/tmp/a.wav", "/tmp/o.pcm").count("-map")), (False, 2))
 # Without this ffmpeg buffers ~8s before its first write, which would delay MIC_READY.
 check("live ffmpeg flushes packets so the pcm file grows immediately",
       "-flush_packets" in _live, True)
@@ -218,6 +229,131 @@ check("boundaries known by t=20 exclude the later one",
 _p2 = sw.SilenceParser()
 _p2.feed_line("[Parsed_silencedetect_0 @ 0x1] silence_end: 3.0 | silence_duration: 1.0")
 check("silence_end without a start is ignored", _p2.midpoints(), [])
+
+
+# --- 2b. band meter parsing -------------------------------------------------------------
+# ffmpeg's three band legs share one stdout and print each reading as a frame header, an
+# astats RMS line, and the band tag added by ametadata. The legs are not guaranteed to
+# interleave, so the parser pairs values as they complete and a frame header must throw a
+# dangling value away rather than let it pair with the next leg's band tag.
+
+def band_lines(lines):
+    """Feed lines to a fresh BandLevelParser and return what it wrote to stdout."""
+    parser = sw.BandLevelParser()
+    saved, sys.stdout = sys.stdout, io.StringIO()
+    try:
+        for line in lines:
+            parser.feed_line(line)
+        return sys.stdout.getvalue().splitlines()
+    finally:
+        sys.stdout = saved
+
+check("a complete reading becomes one LEVEL line",
+      band_lines(["frame:0    pts:0       pts_time:0",
+                  "lavfi.astats.Overall.RMS_level=-32.123456",
+                  "band=low"]),
+      ["LEVEL low -32.1"])
+check("all three bands come through in order",
+      band_lines(["frame:0", "lavfi.astats.Overall.RMS_level=-30.0", "band=low",
+                  "frame:0", "lavfi.astats.Overall.RMS_level=-28.5", "band=mid",
+                  "frame:0", "lavfi.astats.Overall.RMS_level=-44.25", "band=high"]),
+      ["LEVEL low -30.0", "LEVEL mid -28.5", "LEVEL high -44.2"])
+check("a frame header discards a dangling value instead of mispairing it",
+      band_lines(["frame:0", "lavfi.astats.Overall.RMS_level=-30.0",
+                  "frame:1", "band=high"]),
+      [])
+check("parsing recovers on the next complete reading after a broken pair",
+      band_lines(["frame:0", "lavfi.astats.Overall.RMS_level=-30.0",
+                  "frame:1", "band=high",
+                  "frame:2", "lavfi.astats.Overall.RMS_level=-41.5", "band=mid"]),
+      ["LEVEL mid -41.5"])
+check("a band tag with no value pending emits nothing",
+      band_lines(["band=low"]), [])
+check("a malformed dB value is dropped, not emitted",
+      band_lines(["frame:0", "lavfi.astats.Overall.RMS_level=n/a", "band=low"]), [])
+# astats reports digital silence as "-inf", which float() accepts: without the finite check
+# the HUD would be handed "LEVEL low -inf" on a channel it parses as a number.
+check("a -inf reading (digital silence) is dropped, not emitted",
+      band_lines(["frame:0", "lavfi.astats.Overall.RMS_level=-inf", "band=low"]), [])
+check("a nan reading is dropped too",
+      band_lines(["frame:0", "lavfi.astats.Overall.RMS_level=nan", "band=mid"]), [])
+check("every emitted dB value is a plain number",
+      [float(l.split()[2]) < 0 for l in
+       band_lines(["frame:0", "lavfi.astats.Overall.RMS_level=-inf", "band=low",
+                   "frame:1", "lavfi.astats.Overall.RMS_level=-33.0", "band=low"])],
+      [True])
+check("a malformed value does not poison the next reading",
+      band_lines(["frame:0", "lavfi.astats.Overall.RMS_level=n/a", "band=low",
+                  "frame:1", "lavfi.astats.Overall.RMS_level=-20.0", "band=high"]),
+      ["LEVEL high -20.0"])
+
+
+# --- 2c. the bounded level queue ----------------------------------------------------------
+# ffmpeg drives all five output legs from one loop, so if its stdout pipe fills the PCM
+# capture leg stops writing and never resumes. The band pump therefore hands readings to a
+# bounded queue and never blocks; readings that do not fit are dropped on purpose.
+_sink = []
+_em = sw.LevelEmitter(write=_sink.append, maxsize=3)      # not started: nothing drains it
+check("readings are accepted while there is room",
+      [_em.offer("LEVEL low -30.0") for _ in range(3)], [True, True, True])
+check("a full queue drops the reading instead of blocking", _em.offer("LEVEL mid -30.0"), False)
+check("drops are counted", (_em.dropped, _em.queue.qsize()), (1, 3))
+check("dropping does not stop later readings once room appears",
+      (_em.queue.get(), _em.offer("LEVEL high -20.0")), ("LEVEL low -30.0", True))
+
+_drained = []
+_em2 = sw.LevelEmitter(write=_drained.append, maxsize=8)
+_em2.start()
+for _i in range(5):
+    _em2.offer("LEVEL low -%d.0" % (30 + _i))
+check("a running emitter writes every queued reading, in order and none dropped",
+      (_em2.stop(), _drained),
+      (0, ["LEVEL low -30.0", "LEVEL low -31.0", "LEVEL low -32.0",
+           "LEVEL low -33.0", "LEVEL low -34.0"]))
+
+_parsed = []
+_bp = sw.BandLevelParser(_parsed.append)
+for _line in ["frame:0", "lavfi.astats.Overall.RMS_level=-27.5", "band=mid"]:
+    _bp.feed_line(_line)
+check("the parser emits through the sink it was given, not straight to stdout",
+      _parsed, ["LEVEL mid -27.5"])
+
+
+# --- 2d. capture-progress watchdog --------------------------------------------------------
+# A wedged ffmpeg still reports itself alive; only the PCM file stops growing. The threshold
+# is 3.0s, ~30x the worst write gap measured on a real-time capture (median 0.068s, max
+# 0.092s over 625 writes), so it cannot fire on a hiccup.
+
+def watchdog_trips_at(samples, stall_after=sw.CAPTURE_STALL_S):
+    """Feed (size, time) observations; return the time it tripped, or None."""
+    wd = sw.CaptureWatchdog(stall_after=stall_after)
+    for size, when in samples:
+        if wd.observe(size, when):
+            return when
+    return None
+
+# the microphone takes a moment to open: the file legitimately sits at 0 bytes first
+COLD_START = [(0, t / 4.0) for t in range(0, 40)]         # 10s at zero bytes
+check("a slow microphone cold start never trips the watchdog",
+      watchdog_trips_at(COLD_START), None)
+check("cold start then normal growth does not trip",
+      watchdog_trips_at(COLD_START + [(32000 * i, 10.0 + i) for i in range(1, 20)]), None)
+
+STEADY = [(32000 * i, float(i)) for i in range(1, 10)]    # 1s of audio per second
+check("steady capture never trips", watchdog_trips_at(STEADY), None)
+check("a brief hiccup shorter than the threshold does not trip",
+      watchdog_trips_at(STEADY + [(32000 * 9, 9.0 + t / 4.0) for t in range(1, 12)]), None)
+check("a wedged capture trips once the threshold is passed",
+      watchdog_trips_at(STEADY + [(32000 * 9, 9.0 + t / 4.0) for t in range(1, 20)]), 12.0)
+check("growth after a hiccup resets the clock",
+      watchdog_trips_at(STEADY + [(32000 * 9, 11.9), (32000 * 10, 12.0), (32000 * 10, 14.5)]),
+      None)
+_wd = sw.CaptureWatchdog()
+_wd.observe(32000, 1.0)
+_wd.observe(32000, 5.0)
+check("the watchdog reports how long the capture stood still", _wd.stalled_for, 4.0)
+check("a shrinking file is treated as no growth (still stalled)",
+      watchdog_trips_at([(32000, 1.0), (16000, 2.0), (16000, 5.0)]), 5.0)
 
 
 # --- 3. handoff rule on a synthetic 50s timeline ---------------------------------------

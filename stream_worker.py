@@ -9,7 +9,9 @@ Usage:
 Architecture: "rolling handoff, never force-cut".
 
 One ffmpeg captures the microphone to a raw PCM file AND runs silencedetect on a second
-output leg. While recording, whenever enough audio has piled up unprocessed, the worker
+output leg. In live mode it also runs three band-limited RMS meters (bass/mid/treble) whose
+readings this worker republishes on its own stdout as "LEVEL <band> <dB>" lines for the
+dictate.lua HUD. File mode has no HUD to feed, so it gets no band legs. While recording, whenever enough audio has piled up unprocessed, the worker
 cuts it at the MIDPOINT OF A REAL SILENCE and sends that piece to the warm whisper-server.
 On key release only the short tail is left to transcribe, so the wait is short and roughly
 constant instead of growing with dictation length.
@@ -46,9 +48,46 @@ BYTES_PER_SAMPLE = 2                       # mono s16le
 BYTES_PER_SECOND = SAMPLE_RATE * BYTES_PER_SAMPLE
 
 SILENCE_FILTER = "silencedetect=noise=-35dB:d=0.5"
+
+# Three parallel band-limited RMS meters (bass <400Hz, mid 400-2500Hz, treble >2500Hz) whose
+# tagged readings drive the HUD's three bars in dictate.lua. asplit feeds the same live audio
+# to all three; ametadata tags each reading with its band (astats itself has no band concept)
+# and prints to stdout with direct=1 so readings flush per window instead of at EOF. Verified
+# against files: the full command shape (PCM leg + silencedetect -af leg + these three legs)
+# runs clean, silencedetect still fires (2/2 events vs control), PCM output byte-exact.
+BAND_FILTER = (
+    "[0:a]asplit=3[lo][mi][hi];"
+    "[lo]lowpass=f=400,"
+    "astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level,"
+    "ametadata=mode=add:key=band:value=low,"
+    "ametadata=print:file=-:direct=1[olo];"
+    "[mi]highpass=f=400,lowpass=f=2500,"
+    "astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level,"
+    "ametadata=mode=add:key=band:value=mid,"
+    "ametadata=print:file=-:direct=1[omi];"
+    "[hi]highpass=f=2500,"
+    "astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level,"
+    "ametadata=mode=add:key=band:value=high,"
+    "ametadata=print:file=-:direct=1[ohi]"
+)
+
 MIN_ACCUM_S = 22.0                         # only hand off once this much audio is unprocessed
 MIN_CHUNK_S = 5.0                          # never produce a chunk shorter than this
 POLL_S = 0.25                              # how often the handoff rule is evaluated
+
+# How long the PCM file may stand still, once it has started growing, before the capture is
+# treated as wedged. Measured on this machine over 40s of wall-clock-paced capture through
+# the real five-leg command: 625 write events, gap between writes median 0.068s, p95 0.075s,
+# worst 0.092s. 3s is ~30x the worst normal gap, so a hiccup cannot trip it, and it is short
+# enough that a wedge is caught long before the user finishes talking. The counter only
+# starts after the first byte: the microphone legitimately takes a second or two to open.
+CAPTURE_STALL_S = 3.0
+
+# Readings buffered between the band pump and stdout before new ones are dropped. Three
+# bands at ~15 readings/s each is ~45 lines/s, so 256 is roughly 5s of meter history: enough
+# to ride out a consumer that pauses briefly, small enough that a wedged consumer never
+# builds an unbounded backlog. Dropping a meter frame costs a stale HUD bar for one frame.
+LEVEL_QUEUE_MAX = 256
 
 EXIT_EMPTY = 3                             # nothing captured; dictate.lua resets quietly
 EXIT_FAIL = 1
@@ -353,22 +392,124 @@ PCM_OUT_ARGS = ["-c:a", "pcm_s16le", "-flush_packets", "1", "-f", "s16le"]
 
 
 def live_ffmpeg_args(mic_index, path=None, ffmpeg_bin=None):
-    """One process, two output legs: raw PCM to disk, silencedetect to stderr."""
+    """One process, five output legs: raw PCM to disk, silencedetect to stderr, and the three
+    tagged band meters to stdout for the HUD. File mode deliberately lacks the band legs;
+    there is no live HUD to feed when transcribing a file."""
     path = pcm_path() if path is None else path
     return ([ffmpeg_bin or FFMPEG, "-hide_banner", "-y",
              "-f", "avfoundation", "-i", ":%s" % mic_index,
+             "-filter_complex", BAND_FILTER,
              "-ar", str(SAMPLE_RATE), "-ac", "1", "-map", "0:a"] + PCM_OUT_ARGS +
-            [path, "-map", "0:a", "-af", SILENCE_FILTER, "-f", "null", "-"])
+            [path, "-map", "0:a", "-af", SILENCE_FILTER, "-f", "null", "-",
+             "-map", "[olo]", "-f", "null", "-",
+             "-map", "[omi]", "-f", "null", "-",
+             "-map", "[ohi]", "-f", "null", "-"])
 
 
 def file_ffmpeg_args(src, path, ffmpeg_bin=None):
-    """Same two legs, reading a file instead of the microphone."""
+    """Two legs only, reading a file instead of the microphone: raw PCM plus silencedetect.
+
+    No band meters here on purpose; the HUD they feed only exists during a live recording."""
     src_args = ["-i", src]
     if src.endswith(".pcm"):                # headerless: tell ffmpeg what it is looking at
         src_args = ["-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", src]
     return ([ffmpeg_bin or FFMPEG, "-hide_banner", "-y"] + src_args +
             ["-ar", str(SAMPLE_RATE), "-ac", "1", "-map", "0:a"] + PCM_OUT_ARGS +
             [path, "-map", "0:a", "-af", SILENCE_FILTER, "-f", "null", "-"])
+
+
+def print_level_line(line):
+    """Default sink for meter readings: the worker's own stdout, flushed per line."""
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+
+class LevelEmitter(threading.Thread):
+    """Bounded hand-off between the band pump and stdout, so a slow reader cannot wedge us.
+
+    ffmpeg runs all five output legs in one transcode loop, so if its stdout pipe fills
+    because nothing drains it, the PCM capture leg stops writing too and never resumes
+    (measured: capture froze at 15.87s and stayed frozen, and SIGINT then needed the SIGKILL
+    escalation). The band pump must therefore never block. It offers each reading to this
+    bounded queue and moves on; only this thread ever blocks on stdout, and readings that do
+    not fit are dropped. A dropped meter frame is invisible; a frozen recording is not.
+    """
+
+    def __init__(self, write=print_level_line, maxsize=LEVEL_QUEUE_MAX):
+        threading.Thread.__init__(self)
+        self.daemon = True
+        self.queue = queue.Queue(maxsize)
+        self.dropped = 0
+        self._write = write
+
+    def offer(self, line):
+        """Queue one line if there is room. Never blocks; returns True if it was queued."""
+        try:
+            self.queue.put_nowait(line)
+            return True
+        except queue.Full:
+            self.dropped += 1
+            return False
+
+    def run(self):
+        while True:
+            line = self.queue.get()
+            if line is None:
+                return
+            self._write(line)
+
+    def stop(self, timeout=2.0):
+        """Ask the writer to finish. Returns the number of readings dropped, for one log line.
+
+        The sentinel is offered, not forced: if the queue is still full the writer is stuck on
+        a reader that has stopped reading, and blocking here would just move the stall into
+        the shutdown path. The thread is a daemon, so leaving it is safe.
+        """
+        try:
+            self.queue.put_nowait(None)
+        except queue.Full:
+            pass
+        self.join(timeout=timeout)
+        return self.dropped
+
+
+def _finite_or_none(value):
+    """A real dB number, or None. astats reports digital silence as "-inf", which float()
+    accepts happily; forwarding it would put "LEVEL low -inf" on the HUD's number channel."""
+    try:
+        number = float(value)
+    except ValueError:
+        return None
+    return number if -float("inf") < number < float("inf") else None
+
+
+class BandLevelParser:
+    """Pairs astats RMS lines with their band tag and re-emits them as atomic LEVEL lines.
+
+    ffmpeg's three band legs share one stdout, each reading printing as:
+        frame:N ...                                  (header; discards a dangling half-pair)
+        lavfi.astats.Overall.RMS_level=<dB>
+        band=low|mid|high
+    The legs are NOT guaranteed to interleave in any particular order (verified against a
+    file, where ffmpeg drained one leg entirely before the next), so pairs are matched as
+    they complete and a frame header clears a stale value rather than letting it mispair.
+    Each completed pair is re-emitted as one line, "LEVEL <band> <dB>", on the worker's own
+    stdout: the same channel dictate.lua already watches for MIC_READY. `emit` is where that
+    line goes; live mode hands it a LevelEmitter so the pump never blocks on stdout.
+    """
+
+    def __init__(self, emit=print_level_line):
+        self._pending = None
+        self._emit = emit
+
+    def feed_line(self, line):
+        if line.startswith("frame:"):
+            self._pending = None
+        elif line.startswith("lavfi.astats.Overall.RMS_level="):
+            self._pending = _finite_or_none(line.split("=", 1)[1])
+        elif line.startswith("band=") and self._pending is not None:
+            self._emit("LEVEL %s %.1f" % (line[5:].strip(), self._pending))
+            self._pending = None
 
 
 class StderrPump(threading.Thread):
@@ -423,9 +564,50 @@ def _file_size(path):
         return 0
 
 
+class CaptureWatchdog:
+    """Decides whether a live recording has stopped growing while ffmpeg still looks alive.
+
+    A wedged ffmpeg is invisible to `proc.poll()`: the process is up, the PCM file simply
+    never grows again. Without this, the run ends normally and pastes a silently truncated
+    transcript. Kept as a plain decision object with no clock and no filesystem of its own so
+    a test can feed it a timeline of (size, time) observations.
+
+    The counter starts at the first byte, never at process start: opening the microphone
+    legitimately leaves the file at zero for a second or two, and that is not a stall.
+    """
+
+    def __init__(self, stall_after=CAPTURE_STALL_S):
+        self.stall_after = stall_after
+        self.last_size = 0
+        self.last_growth_at = None          # None until the first byte is captured
+        self.stalled_for = 0.0              # how long the last observation had stood still
+
+    def observe(self, size, now):
+        """Record one (size, time) sample. True means the capture is wedged."""
+        if size > self.last_size:
+            self.last_size = size
+            self.last_growth_at = now
+            self.stalled_for = 0.0
+            return False
+        if self.last_growth_at is None:     # still waiting for the microphone to open
+            return False
+        self.stalled_for = now - self.last_growth_at
+        return self.stalled_for >= self.stall_after
+
+
 # --------------------------------------------------------------------------------------
 # Live mode
 # --------------------------------------------------------------------------------------
+
+def _report_levels_dropped(dropped):
+    """One summary line if meter readings were dropped, and nothing at all if none were.
+
+    Dropping means the HUD stopped keeping up, which is worth knowing about after the fact
+    but must never turn into per-reading noise in the log.
+    """
+    if dropped:
+        log("dropped %d meter reading(s): the stdout reader could not keep up" % dropped)
+
 
 def run_live(mic_index, cfg, copy=False, timings=False):
     stop = threading.Event()
@@ -441,20 +623,26 @@ def run_live(mic_index, cfg, copy=False, timings=False):
     _quiet_remove(live_pcm)
     t_start = time.time()
     proc = subprocess.Popen(live_ffmpeg_args(mic_index, live_pcm, cfg.get("ffmpeg_bin")),
-                            stdout=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, bufsize=0, start_new_session=True)
     parser = SilenceParser()
     pump = StderrPump(proc.stderr, parser)
     pump.start()
+    levels = LevelEmitter()                 # only this thread may block on stdout
+    levels.start()
+    band_pump = StderrPump(proc.stdout, BandLevelParser(levels.offer))  # stdout leg, same pump
+    band_pump.start()
 
     transcriber = ChunkTranscriber(cfg)
     transcriber.start()
     session = StreamSession(live_pcm, transcriber)
 
+    watchdog = CaptureWatchdog()
     mic_ready = False
     t_ready = None
     while not stop.is_set():
-        if not mic_ready and _file_size(live_pcm) > 0:
+        size = _file_size(live_pcm)
+        if not mic_ready and size > 0:
             mic_ready = True
             t_ready = time.time()
             sys.stdout.write("MIC_READY\n")
@@ -466,13 +654,27 @@ def run_live(mic_index, cfg, copy=False, timings=False):
             sys.stderr.write("ffmpeg exited early (rc=%s) while recording from mic %s:\n%s\n"
                              % (proc.returncode, mic_index, pump.tail_text()))
             return EXIT_FAIL
+        if watchdog.observe(size, time.time()):
+            # ffmpeg is still up but has stopped writing audio. Finishing normally here would
+            # transcribe a truncated recording and paste it as if nothing had gone wrong.
+            _stop_ffmpeg(proc)
+            _report_levels_dropped(levels.stop())
+            log("capture stalled: pcm stuck at %d bytes for %.1fs on mic %s (audio kept at %s): %s"
+                % (size, watchdog.stalled_for, mic_index, live_pcm, pump.tail_text()[-400:]))
+            sys.stderr.write("recording stalled after %.1fs with no new audio (stuck at %.1fs "
+                             "captured on mic %s).\nAudio kept for recovery: %s\n"
+                             % (watchdog.stalled_for, size / float(BYTES_PER_SECOND),
+                                mic_index, live_pcm))
+            return EXIT_FAIL
         if mic_ready:
-            session.maybe_handoff(parser.midpoints(), _file_size(live_pcm) / float(BYTES_PER_SECOND))
+            session.maybe_handoff(parser.midpoints(), size / float(BYTES_PER_SECOND))
         time.sleep(POLL_S)
 
     t_release = time.time()
     _stop_ffmpeg(proc)                      # SIGINT, then wait: the PCM file is flushed on exit
     pump.join(timeout=2.0)
+    band_pump.join(timeout=2.0)
+    _report_levels_dropped(levels.stop())
     # Recording is over but transcription can still take seconds, and a fresh key press
     # starts a worker that deletes the live PCM file and records over it. Restoring the
     # default signal handlers keeps that pkill -INT able to kill us instead of being swallowed.

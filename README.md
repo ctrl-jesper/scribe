@@ -85,20 +85,18 @@ Answers you already gave are shown as defaults, so a rerun only asks you to conf
 
 Hold the push-to-talk key (Right Option by default), wait for the cue, speak, release.
 
-1. **Hold** the key. The menu-bar icon shows a warming-up state while the microphone starts.
-2. **Wait for the cue** - a short tone and a "speak" alert. The microphone has a brief cold
-   start; speaking before the cue clips your first word.
-3. **Speak.**
-4. **Release.** The cleaned text pastes at your cursor.
+1. **Hold** the key.
+2. **Wait for the cue** - a short tone, and a small dark pill appears center-screen. The
+   microphone has a brief cold start; speaking before the cue clips your first word.
+3. **Speak.** The pill shows three bars that react to your voice, one per frequency band:
+   bass on the left, mids in the middle, treble on the right. If the bars move when you
+   talk, the right microphone is live.
+4. **Release.** The bars collapse into three dots that bounce while Scribe transcribes,
+   then the pill fades and the cleaned text pastes at your cursor.
 
-Menu-bar icon states:
-
-| Icon | Meaning |
-|---|---|
-| (plain mic icon) | idle |
-| 🔴 | recording |
-| ⏳ | transcribing |
-| ✨ | polishing (AI cleanup pass) |
+The menu-bar icon mirrors the same states in miniature: three still dots when idle, small
+live-level bars while recording, and a left-to-right dot cycle while transcribing or
+running the AI polish. If the drawn icon ever fails to render, it falls back to emoji.
 
 Other actions:
 

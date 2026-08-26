@@ -5,11 +5,14 @@
 --
 -- Hold the push-to-talk key (default RIGHT OPTION, keycode 61). Wait for the "speak" cue,
 -- which fires only once the microphone is actually capturing (ffmpeg has a 1-2s cold start,
--- so speaking before the cue clips the start of your first word). Release to transcribe + paste.
+-- so speaking before the cue clips the start of your first word). At the cue a pill-shaped
+-- HUD appears center-screen: three bars that answer to your actual voice (three real frequency
+-- bands, read live off ffmpeg's astats filter), collapsing into three dots that bounce left to
+-- right, iMessage-style, while Scribe transcribes. Release to transcribe + paste.
 --
--- A menu-bar icon shows live status. Listeners live in the global table `scribe` so
--- Hammerspoon's garbage collector does not reclaim them (that reclaim is what made recording
--- "stop working").
+-- A menu-bar icon in the same three-mark family shows live status. Listeners live in the
+-- global table `scribe` so Hammerspoon's garbage collector does not reclaim them (that reclaim
+-- is what made recording "stop working").
 --
 -- Nothing on the push-to-talk path may block. macOS disables an event tap whose callback
 -- takes too long, which is the same class of failure as the GC bug above. Every subprocess
@@ -25,8 +28,11 @@ if scribe then
     if scribe.menu then scribe.menu:delete() end
     if scribe.cueTimer then scribe.cueTimer:stop() end
     if scribe.batchTimeout then scribe.batchTimeout:stop() end
+    if scribe.animTimer then scribe.animTimer:stop() end          -- HUD morph / typing bounce
+    if scribe.menuAnimTimer then scribe.menuAnimTimer:stop() end   -- menu-bar glyph animation
+    if scribe.hud then scribe.hud:delete() end
     if scribe.recTask then pcall(function() scribe.recTask:terminate() end) end
-    hs.alert.closeAll(0)                           -- drop any lingering transcribing/speak notice
+    hs.alert.closeAll(0)                           -- drop any lingering alert
 end
 scribe = {}
 scribe.recording = false        -- the mic is open right now
@@ -99,40 +105,6 @@ scribe.micName = configString(cfg.mic_name)
 scribe.streaming = hs.settings.get("scribe.streaming")
 if scribe.streaming == nil then scribe.streaming = false end
 
--- Menu-bar icon: a microphone with a waveform behind it, drawn in code as a template image so
--- it adapts to light and dark menu bars. Status (recording, transcribing, polishing) shows as
--- a small emoji NEXT TO the icon; idle shows the icon alone.
-local function makeMicIcon()
-    local c = hs.canvas.new({ x = 0, y = 0, w = 20, h = 18 })
-    local e = {}
-    for _, b in ipairs({ { x = 2, h = 6 }, { x = 5, h = 10 }, { x = 15, h = 10 }, { x = 18, h = 6 } }) do
-        e[#e + 1] = { type = "rectangle", action = "fill",            -- waveform bars, faded
-            fillColor = { black = 1, alpha = 0.45 },
-            roundedRectRadii = { xRadius = 0.75, yRadius = 0.75 },
-            frame = { x = b.x - 0.75, y = 8.5 - b.h / 2, w = 1.5, h = b.h } }
-    end
-    e[#e + 1] = { type = "rectangle", action = "fill", fillColor = { black = 1 },   -- mic capsule
-        roundedRectRadii = { xRadius = 2, yRadius = 2 }, frame = { x = 8, y = 1.5, w = 4, h = 8.5 } }
-    e[#e + 1] = { type = "arc", action = "stroke", strokeColor = { black = 1 },      -- U-shaped holder
-        strokeWidth = 1.4, arcRadii = false,
-        center = { x = 10, y = 8.5 }, radius = 4.2, startAngle = 90, endAngle = 270 }
-    e[#e + 1] = { type = "segments", action = "stroke", strokeColor = { black = 1 }, -- stem
-        strokeWidth = 1.4, coordinates = { { x = 10, y = 12.7 }, { x = 10, y = 15 } } }
-    e[#e + 1] = { type = "segments", action = "stroke", strokeColor = { black = 1 }, -- base
-        strokeWidth = 1.4, coordinates = { { x = 7, y = 15.7 }, { x = 13, y = 15.7 } } }
-    c:replaceElements(e)
-    local img = c:imageFromCanvas()
-    c:delete()
-    return img
-end
-
-local IDLE = ""                                    -- idle shows the icon alone, no title text
-scribe.menu = hs.menubar.new()
-local okIcon = pcall(function() scribe.menu:setIcon(makeMicIcon(), true) end)
-if not okIcon then IDLE = "🎙️" end                 -- fallback: emoji title if canvas drawing fails
-local function setStatus(txt) if scribe.menu then scribe.menu:setTitle(txt) end end
-setStatus(IDLE)
-
 local function log(message)
     print("[Scribe] " .. message)
 end
@@ -142,6 +114,392 @@ end
 local function alertProblem(message, seconds)
     log(message)
     hs.alert.show("Scribe: " .. message, seconds or 3)
+end
+
+-- ---------------------------------------------------------------------------
+-- Live level measurement
+-- ---------------------------------------------------------------------------
+
+-- Three bars = three real frequency bands (bass/mid/treble of the incoming voice), not three
+-- staggered copies of one overall loudness number: the bands genuinely diverge moment to
+-- moment. asplit sends the same live audio down three parallel filter chains, each band-limited
+-- then measured by astats; ametadata tags each reading with which band it is before printing,
+-- since astats itself has no band-name concept. direct=1 flushes per reading instead of
+-- buffering to end-of-file.
+local ASTATS_BAND_FILTER = table.concat({
+    "[0:a]asplit=3[lo][mi][hi];",
+    "[lo]lowpass=f=400,",
+      "astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level,",
+      "ametadata=mode=add:key=band:value=low,",
+      "ametadata=print:file=-:direct=1[olo];",
+    "[mi]highpass=f=400,lowpass=f=2500,",
+      "astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level,",
+      "ametadata=mode=add:key=band:value=mid,",
+      "ametadata=print:file=-:direct=1[omi];",
+    "[hi]highpass=f=2500,",
+      "astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level,",
+      "ametadata=mode=add:key=band:value=high,",
+      "ametadata=print:file=-:direct=1[ohi]",
+})
+
+-- Per-band dB ranges mapped to bar height. A band-limited slice reads quieter than the full
+-- signal, and unevenly so. Each band gets its own floor/ceiling so all three bars live in the
+-- same visual range on normal speech; tune per band if one still looks flat or pinned live.
+local BAND_RANGE = {
+    low  = { floor = -50, ceil = -16 },
+    mid  = { floor = -50, ceil = -12 },
+    high = { floor = -58, ceil = -20 },
+}
+
+-- ---------------------------------------------------------------------------
+-- Pill HUD geometry (shared by the center-screen HUD and the menu-bar glyph)
+-- ---------------------------------------------------------------------------
+
+local BAR_COUNT = 3
+local BAR_W, BAR_GAP = 7, 17
+local PILL_W, PILL_H = 130, 68
+local MIN_BAR_H, MAX_BAR_H = 9, 40
+local DOT_D = 8
+
+local function barFrame(i, h)
+    local totalW = BAR_COUNT * BAR_W + (BAR_COUNT - 1) * BAR_GAP
+    local startX = (PILL_W - totalW) / 2
+    local x = startX + (i - 1) * (BAR_W + BAR_GAP)
+    return { x = x, y = (PILL_H - h) / 2, w = BAR_W, h = h }
+end
+
+local function screenCenterFrame(w, h)
+    local f = hs.screen.mainScreen():frame()
+    return { x = f.x + (f.w - w) / 2, y = f.y + (f.h - h) / 2 - 60, w = w, h = h }
+end
+
+-- Build the HUD once (index 1 = pill background, 2..4 = the three bars/dots). Reused across
+-- every dictation rather than recreated, so there is no per-dictation canvas-allocation cost.
+local function makeHUD()
+    local c = hs.canvas.new(screenCenterFrame(PILL_W, PILL_H))
+    c:level(hs.canvas.windowLevels.overlay)
+    c:behavior(hs.canvas.windowBehaviors.canJoinAllSpaces | hs.canvas.windowBehaviors.stationary)
+    c:clickActivating(false)
+    local elems = {
+        { type = "rectangle", action = "fill",   -- "roundedRectangle" is not a real hs.canvas
+          -- type; rounded corners come from roundedRectRadii on a plain rectangle. Borderless
+          -- dark pill: no stroke, by design.
+          fillColor = { red = 0.11, green = 0.11, blue = 0.12, alpha = 0.82 },
+          roundedRectRadii = { xRadius = PILL_H / 2, yRadius = PILL_H / 2 },
+          frame = { x = 0, y = 0, w = PILL_W, h = PILL_H } },
+    }
+    for i = 1, BAR_COUNT do
+        elems[#elems + 1] = { type = "rectangle", action = "fill",
+            fillColor = { white = 0.84, alpha = 0.9 },
+            roundedRectRadii = { xRadius = BAR_W / 2, yRadius = BAR_W / 2 },
+            frame = barFrame(i, MIN_BAR_H) }
+    end
+    c:replaceElements(elems)
+    return c
+end
+
+local function setBar(i, frame, isDot)
+    scribe.lastBarFrame = scribe.lastBarFrame or {}
+    scribe.lastBarFrame[i] = frame  -- read by the menu-bar poll and by the release morph's start point
+    if not scribe.hud then return end
+    scribe.hud:elementAttribute(i + 1, "frame", frame)
+    scribe.hud:elementAttribute(i + 1, "roundedRectRadii",
+        isDot and { xRadius = DOT_D / 2, yRadius = DOT_D / 2 } or { xRadius = BAR_W / 2, yRadius = BAR_W / 2 })
+end
+
+local function showHUD()
+    if not scribe.hud then scribe.hud = makeHUD() end
+    for i = 1, BAR_COUNT do setBar(i, barFrame(i, MIN_BAR_H), false) end
+    scribe.hud:alpha(1)
+    scribe.hud:show()
+end
+
+local function hideHUD(fade)
+    if not scribe.hud then return end
+    if fade then scribe.hud:hide(0.3) else scribe.hud:hide() end
+end
+
+-- ---------------------------------------------------------------------------
+-- Recording animation: each bar is driven by its own frequency band, smoothed
+-- like a real audio meter so the three move as a small ripple rather than
+-- snapping in lockstep.
+-- ---------------------------------------------------------------------------
+
+local function dbToHeight(band, db)
+    local r = BAND_RANGE[band]
+    if not r then return MIN_BAR_H end
+    local t = (db - r.floor) / (r.ceil - r.floor)
+    if t < 0 then t = 0 elseif t > 1 then t = 1 end
+    t = t ^ 0.6   -- boosts quiet-to-moderate speech so movement stays visible, not just loud peaks
+    return MIN_BAR_H + t * (MAX_BAR_H - MIN_BAR_H)
+end
+
+-- One smoother per band (bar 1 = low, bar 2 = mid, bar 3 = high), each fed by its own
+-- genuinely different signal. Asymmetric, like a real audio meter: a bar RISES quickly when
+-- energy arrives (speech still feels instant) but FALLS slowly (per-window jitter melts away
+-- instead of flickering).
+local ATTACK_ALPHA, DECAY_ALPHA = 0.5, 0.15
+local emaLow, emaMid, emaHigh = MIN_BAR_H, MIN_BAR_H, MIN_BAR_H
+
+local function smoothTo(current, target)
+    local a = (target > current) and ATTACK_ALPHA or DECAY_ALPHA
+    return current + a * (target - current)
+end
+
+local function pushBandLevel(band, db)
+    -- Only while the mic is open. A reading that arrives after release (the recorder is
+    -- signalled, not killed, so a last chunk can still land) would otherwise fight the release
+    -- morph for the same bar frames.
+    if not scribe.recording then return end
+    local target = dbToHeight(band, db)
+    if band == "low" then
+        emaLow = smoothTo(emaLow, target)
+        setBar(1, barFrame(1, emaLow), false)
+    elseif band == "mid" then
+        emaMid = smoothTo(emaMid, target)
+        setBar(2, barFrame(2, emaMid), false)
+    elseif band == "high" then
+        emaHigh = smoothTo(emaHigh, target)
+        setBar(3, barFrame(3, emaHigh), false)
+    end
+end
+
+-- hs.task hands stdout over in arbitrary chunks that are not necessarily whole lines, so both
+-- parsers below keep a buffer and only ever act on complete lines. Returns the leftover tail.
+local function completeLines(buffer, onLine)
+    for line in buffer:gmatch("([^\n]*)\n") do onLine(line) end
+    local lastNL = buffer:find("\n[^\n]*$")
+    if not lastNL then return buffer end   -- no newline yet: keep the partial line for next time
+    return buffer:sub(lastNL + 1)
+end
+
+-- Parses the streaming worker's stdout: clean, atomic "LEVEL <band> <dB>" lines that the
+-- worker's own Python parser produces from the same three-band graph, plus MIC_READY. The
+-- worker pre-pairs readings on its side, so this parser is a straight line-per-reading match.
+local workerBuf = ""
+local function feedWorkerChunk(text)
+    if not text or text == "" then return end
+    workerBuf = completeLines(workerBuf .. text, function(line)
+        local band, db = line:match("^LEVEL (%a+) (-?[%d%.]+)")
+        if band and db then pushBandLevel(band, tonumber(db)) end
+    end)
+end
+
+-- Parses ffmpeg's tagged astats stdout as it streams in. Each reading prints as two lines, an
+-- "RMS_level=" line followed by a "band=low|mid|high" line identifying which of the three
+-- parallel filter chains it came from; a "frame:N ..." header line precedes both and is
+-- ignored. The three bands are NOT assumed to arrive in any particular order or interleaving,
+-- so each band updates independently whenever its own reading actually arrives.
+local levelBuf = ""
+local pendingRMS = nil
+local function feedLevelChunk(text)
+    if not text or text == "" then return end
+    levelBuf = completeLines(levelBuf .. text, function(line)
+        local db = line:match("RMS_level=(-?[%d%.]+)")
+        local band = line:match("^band=(%a+)")
+        if line:find("^frame:") then
+            pendingRMS = nil   -- a header before the tag means the pair broke; discard, never mispair
+        elseif db then
+            pendingRMS = tonumber(db)
+        elseif band and pendingRMS then
+            pushBandLevel(band, pendingRMS)
+            pendingRMS = nil
+        end
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Transcribing animation: the iMessage typing bounce. Each dot lifts on its
+-- own delay (150ms stagger) and settles before the next starts, 1.15s loop.
+-- ---------------------------------------------------------------------------
+
+local function startTypingBounce()
+    if scribe.animTimer then scribe.animTimer:stop() end
+    local t0 = hs.timer.secondsSinceEpoch()
+    local period, stagger, lift = 1.15, 0.15, 7
+    scribe.animTimer = hs.timer.doEvery(0.03, function()
+        local t = hs.timer.secondsSinceEpoch() - t0
+        for i = 1, BAR_COUNT do
+            local phase = ((t - (i - 1) * stagger) % period) / period
+            -- ease in/out lift over the first ~40% of the cycle, settle for the rest
+            local lifted = 0
+            if phase < 0.4 then
+                lifted = lift * math.sin((phase / 0.4) * math.pi)
+            end
+            local base = barFrame(i, DOT_D)
+            base.y = base.y - lifted
+            setBar(i, base, true)
+        end
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Release transition: bars pinch and sweep into dots, left to right with a
+-- slight overlap, before the steady-state typing bounce takes over. Only uses
+-- elementAttribute()/frame/roundedRectRadii, so this adds motion, not new
+-- Hammerspoon API surface.
+-- ---------------------------------------------------------------------------
+
+local function lerp(a, b, t) return a + (b - a) * t end
+local function easeOutCubic(t) return 1 - (1 - t) ^ 3 end
+
+local function startMorphToDots()
+    if scribe.animTimer then scribe.animTimer:stop() end
+    local startFrame, targetFrame = {}, {}
+    for i = 1, BAR_COUNT do
+        startFrame[i] = (scribe.lastBarFrame and scribe.lastBarFrame[i]) or barFrame(i, MIN_BAR_H)
+        targetFrame[i] = barFrame(i, DOT_D)
+    end
+
+    local stagger, dur = 0.07, 0.26   -- ~70ms between bars, ~260ms each -> ~400ms total sweep
+    local total = stagger * (BAR_COUNT - 1) + dur
+    local t0 = hs.timer.secondsSinceEpoch()
+    scribe.animTimer = hs.timer.doEvery(0.02, function()
+        local t = hs.timer.secondsSinceEpoch() - t0
+        if t >= total then
+            startTypingBounce()   -- hand off to the steady-state bounce
+            return
+        end
+        for i = 1, BAR_COUNT do
+            local localT = t - (i - 1) * stagger
+            if localT <= 0 then
+                setBar(i, startFrame[i], false)
+            else
+                local p = math.min(localT / dur, 1)
+                local e = easeOutCubic(p)
+                local pinch = math.sin(p * math.pi)   -- 0 at both ends, peak at the midpoint
+                local sF, tF = startFrame[i], targetFrame[i]
+                local cx = lerp(sF.x + sF.w / 2, tF.x + tF.w / 2, e)   -- interpolate the CENTER,
+                local cy = lerp(sF.y + sF.h / 2, tF.y + tF.h / 2, e)   -- so a narrowing bar stays
+                local w = math.max(2, lerp(sF.w, tF.w, e) - pinch * (sF.w * 0.35))  -- centered, not drifting
+                local h = lerp(sF.h, tF.h, e)
+                local radius = lerp(BAR_W / 2, DOT_D / 2, e)
+                if scribe.hud then
+                    scribe.hud:elementAttribute(i + 1, "frame", { x = cx - w / 2, y = cy - h / 2, w = w, h = h })
+                    scribe.hud:elementAttribute(i + 1, "roundedRectRadii", { xRadius = radius, yRadius = radius })
+                end
+            end
+        end
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Menu-bar glyph: the same three-mark family at a scale that fits the menu
+-- bar, drawn as a template image so it adapts to light and dark menu bars.
+-- ---------------------------------------------------------------------------
+
+local MB_W, MB_H = 20, 14
+local MB_DOT_D = 3.6   -- fixed diameter for the idle/transcribing dots; only their Y moves
+
+local function mbSlotX(i, w)
+    local gap = 4.4
+    local totalW = BAR_COUNT * w + (BAR_COUNT - 1) * gap
+    local startX = (MB_W - totalW) / 2
+    return startX + (i - 1) * (w + gap)
+end
+
+-- Recording: bars, width fixed, height varies to read as a waveform.
+local function makeMenuBars(heights)
+    local c = hs.canvas.new({ x = 0, y = 0, w = MB_W, h = MB_H })
+    local elems = {}
+    local w = 2.6
+    for i = 1, BAR_COUNT do
+        local h = heights[i]
+        elems[#elems + 1] = { type = "rectangle", action = "fill",
+            fillColor = { black = 1, alpha = 0.85 },
+            roundedRectRadii = { xRadius = w / 2, yRadius = w / 2 },
+            frame = { x = mbSlotX(i, w), y = (MB_H - h) / 2, w = w, h = h } }
+    end
+    c:replaceElements(elems)
+    local img = c:imageFromCanvas()
+    c:delete()
+    return img
+end
+
+-- Idle and transcribing: dots, a fixed small circle per mark, moved up by yOffset[i] to bounce.
+-- Distinct from the bars above on purpose: a rectangle that only changes height still reads as
+-- a bar no matter how round its corners are, so the dots keep a fixed diameter and move in Y.
+local function makeMenuDots(yOffsets)
+    local c = hs.canvas.new({ x = 0, y = 0, w = MB_W, h = MB_H })
+    local elems = {}
+    local baseY = (MB_H - MB_DOT_D) / 2
+    for i = 1, BAR_COUNT do
+        elems[#elems + 1] = { type = "rectangle", action = "fill",
+            fillColor = { black = 1, alpha = 0.85 },
+            roundedRectRadii = { xRadius = MB_DOT_D / 2, yRadius = MB_DOT_D / 2 },  -- true circle
+            frame = { x = mbSlotX(i, MB_DOT_D), y = baseY - (yOffsets[i] or 0), w = MB_DOT_D, h = MB_DOT_D } }
+    end
+    c:replaceElements(elems)
+    local img = c:imageFromCanvas()
+    c:delete()
+    return img
+end
+
+local IDLE_ICON = nil   -- built below, once the menu bar itself exists
+
+-- If canvas drawing is unavailable, every state falls back to an emoji title instead. That is
+-- the only case where Scribe still puts status text in the menu bar.
+local function applyMenuIcon(image, fallbackText)
+    if not scribe.menu then return end
+    if scribe.iconsOk and image then
+        scribe.menu:setIcon(image, true)
+    else
+        scribe.menu:setTitle(fallbackText)
+    end
+end
+
+local function setMenuIdle()
+    if scribe.menuAnimTimer then scribe.menuAnimTimer:stop() end
+    applyMenuIcon(IDLE_ICON, "🎙️")
+end
+
+local MB_MIN_H, MB_MAX_H = 3, 11
+local function scaleToMenuBar(hudHeight)
+    local t = (hudHeight - MIN_BAR_H) / (MAX_BAR_H - MIN_BAR_H)
+    if t < 0 then t = 0 elseif t > 1 then t = 1 end
+    return MB_MIN_H + t * (MB_MAX_H - MB_MIN_H)
+end
+
+-- Reflects the SAME live level driving the HUD bars, polled at a modest rate, rather than a
+-- canned on/off toggle: a blink every N milliseconds has nothing to do with your actual voice.
+local function setMenuRecording()
+    if scribe.menuAnimTimer then scribe.menuAnimTimer:stop() end
+    if not scribe.iconsOk then
+        applyMenuIcon(nil, "🔴")
+        return
+    end
+    scribe.menuAnimTimer = hs.timer.doEvery(0.15, function()
+        local heights = {}
+        for i = 1, BAR_COUNT do
+            local f = scribe.lastBarFrame and scribe.lastBarFrame[i]
+            heights[i] = scaleToMenuBar(f and f.h or MIN_BAR_H)
+        end
+        applyMenuIcon(makeMenuBars(heights), "🔴")
+    end)
+end
+
+local function setMenuTranscribing()
+    if scribe.menuAnimTimer then scribe.menuAnimTimer:stop() end
+    if not scribe.iconsOk then
+        applyMenuIcon(nil, "⏳")
+        return
+    end
+    local frame = 0
+    local shapes = { { 1.6, 0, 0 }, { 0, 1.6, 0 }, { 0, 0, 1.6 } }   -- 3-frame left-to-right lift
+    scribe.menuAnimTimer = hs.timer.doEvery(0.35, function()
+        frame = frame % 3 + 1
+        applyMenuIcon(makeMenuDots(shapes[frame]), "⏳")
+    end)
+end
+
+scribe.menu = hs.menubar.new()
+local okIcon, idleImage = pcall(makeMenuDots, { 0, 0, 0 })
+IDLE_ICON = okIcon and idleImage or nil
+scribe.iconsOk = (okIcon and IDLE_ICON ~= nil
+    and pcall(function() scribe.menu:setIcon(IDLE_ICON, true) end)) or false
+if not scribe.iconsOk then
+    log("menu-bar icon could not be drawn; falling back to emoji titles")
+    scribe.menu:setTitle("🎙️")
 end
 
 -- ---------------------------------------------------------------------------
@@ -199,7 +557,7 @@ end
 --   [AVFoundation indev @ 0x7f8] AVFoundation video devices:
 --   [AVFoundation indev @ 0x7f8] [0] FaceTime HD Camera
 --   [AVFoundation indev @ 0x7f8] AVFoundation audio devices:
---   [AVFoundation indev @ 0x7f8] [0] MacBook Air Microphone
+--   [AVFoundation indev @ 0x7f8] [0] Built-in Microphone
 -- Only the audio section may be searched, or an unmatched name lands on a camera.
 local AUDIO_HEADER = "avfoundation audio devices"
 local VIDEO_HEADER = "avfoundation video devices"
@@ -271,27 +629,26 @@ local function cueSpeak()
     if scribe.recording and not scribe.cued then
         scribe.cued = true
         if CUE_SOUND then CUE_SOUND:play() end
-        setStatus("🔴")
-        hs.alert.show("● speak", 0.7)
+        -- Fresh baseline so the menu-bar poll and the next release's morph never read stale
+        -- frames left over from the previous dictation.
+        scribe.lastBarFrame = { barFrame(1, MIN_BAR_H), barFrame(2, MIN_BAR_H), barFrame(3, MIN_BAR_H) }
+        setMenuRecording()   -- first, so the menu bar updates even if the HUD below errors
+        local ok, err = pcall(showHUD)
+        if not ok then log("HUD error: " .. tostring(err)) end
+        -- Both modes feed real band levels (batch parses ffmpeg directly, streaming parses the
+        -- worker's LEVEL lines), so both start from the same clean baseline.
+        emaLow, emaMid, emaHigh = MIN_BAR_H, MIN_BAR_H, MIN_BAR_H
+        levelBuf, pendingRMS, workerBuf = "", nil, ""
     end
 end
 
--- Center-screen "transcribing" notice, mirroring the "● speak" cue: shown on key release and
--- closed the moment the result pastes (or the run fails), so its lifetime shows real progress.
-local function showTranscribing()
-    scribe.transcribeAlert = hs.alert.show("● transcribing…", 120)
-end
-local function closeTranscribing()
-    if scribe.transcribeAlert then
-        hs.alert.closeSpecific(scribe.transcribeAlert)
-        scribe.transcribeAlert = nil
-    end
-end
-
+-- Everything a finished (or failed) run has to undo: the HUD animation, the HUD itself, and
+-- the menu-bar state. Errors still speak for themselves through alertProblem.
 local function finishTranscription()
     scribe.transcribing = false
-    closeTranscribing()
-    setStatus(IDLE)
+    if scribe.animTimer then scribe.animTimer:stop() end
+    hideHUD(true)
+    setMenuIdle()
 end
 
 -- ---------------------------------------------------------------------------
@@ -309,7 +666,6 @@ local function wavBytes()
 end
 
 local function transcribeAndPaste()
-    setStatus("⏳")                                               -- transcribing
     -- Two halves of the same guarantee, both provided by pipeline.py:
     --   --not-older-than  refuses a WAV written before this recording started, so a recorder
     --                     that silently failed cannot get the PREVIOUS dictation pasted.
@@ -370,7 +726,9 @@ local function batchRecorderFinished(exitCode, _, stderr)
         -- rather than letting the release paste a stale result.
         scribe.recording, scribe.cued = false, false
         if scribe.cueTimer then scribe.cueTimer:stop() end
-        setStatus(IDLE)
+        if scribe.animTimer then scribe.animTimer:stop() end
+        hideHUD(true)
+        setMenuIdle()
         alertProblem("could not open the microphone (ffmpeg exit " .. tostring(exitCode) .. ")", 4)
         log("recorder stderr: " .. (stderr or ""))
         return
@@ -434,15 +792,18 @@ local function startRecording()
     end
 
     scribe.recording, scribe.cued = true, false
-    setStatus("🎙️…")                                              -- warming up (mic cold start)
 
     if scribe.activeStreaming then
         if scribe.workerPid then signalPid(scribe.workerPid) end  -- a worker left by a crashed run
         -- The worker owns ffmpeg internally; dictate.lua only starts it, watches stdout for the
-        -- ready cue, and signals it to stop. It transcribes, copies to the clipboard, and exits.
+        -- ready cue and the LEVEL lines that drive the HUD, and signals it to stop. It
+        -- transcribes, copies to the clipboard, and exits.
         scribe.recTask = hs.task.new(PYTHON, streamWorkerFinished,
-            function(_, stdOut, _)                                 -- stream callback: cue once mic is capturing
-                if stdOut and stdOut:find("MIC_READY") then cueSpeak() end
+            function(_, stdOut, _)                                 -- stream callback: cue, then levels
+                if stdOut then
+                    if stdOut:find("MIC_READY") then cueSpeak() end
+                    feedWorkerChunk(stdOut)                        -- "LEVEL <band> <dB>" -> HUD bars
+                end
                 return true
             end,
             { WORKER_PATH, "--mic", scribe.micIndex, "--copy" })
@@ -454,19 +815,27 @@ local function startRecording()
         os.remove(WAV)
         scribe.sessionStart = os.time()
         scribe.pendingTranscribe = false
+        -- One process, several output legs: the WAV Scribe transcribes, plus three tagged dB
+        -- readings, one per frequency band, that drive the HUD's bars. -filter_complex turns
+        -- off ffmpeg's automatic stream mapping, so the WAV leg needs its own explicit -map.
         scribe.recTask = hs.task.new(FFMPEG, batchRecorderFinished,
-            function(_, stdOut, stdErr)                            -- stream callback: cue once frames flow
+            function(_, stdOut, stdErr)                            -- stream callback: cue, then levels
                 if ((stdOut or "") .. (stdErr or "")):find("size=") then cueSpeak() end
+                if stdOut then feedLevelChunk(stdOut) end
                 return true
             end,
             { "-y", "-f", "avfoundation", "-i", ":" .. scribe.micIndex,
-              "-ar", "16000", "-ac", "1", "-sample_fmt", "s16", WAV })
+              "-filter_complex", ASTATS_BAND_FILTER,
+              "-map", "0:a", "-ar", "16000", "-ac", "1", "-sample_fmt", "s16", WAV,
+              "-map", "[olo]", "-f", "null", "-",
+              "-map", "[omi]", "-f", "null", "-",
+              "-map", "[ohi]", "-f", "null", "-" })
     end
     if not scribe.recTask then
         -- hs.task.new returns nil if it cannot launch. Fail here rather than
         -- raising a Lua error inside the event tap callback.
         scribe.recording, scribe.cued = false, false
-        setStatus(IDLE)
+        setMenuIdle()
         alertProblem("could not start the recorder", 4)
         return
     end
@@ -484,8 +853,10 @@ local function stopRecording()
     scribe.recording, scribe.cued = false, false
     if scribe.cueTimer then scribe.cueTimer:stop() end
     scribe.transcribing = true
-    setStatus("⏳")
-    showTranscribing()
+    -- The bars sweep into dots and then bounce; that is the "transcribing" notice now, in both
+    -- modes, so it starts on release rather than waiting for the recorder to exit.
+    startMorphToDots()
+    setMenuTranscribing()
 
     if scribe.activeStreaming then
         -- Worker owns ffmpeg and finishes the job itself (transcribe + clipboard copy); its
@@ -525,10 +896,10 @@ local function doPolish()
         alertProblem("python3 not found, run install.sh again", 4)
         return
     end
-    setStatus("✨")                                               -- polishing
+    setMenuTranscribing()                                         -- same "working" state as a dictation
     hs.alert.show("polishing last dictation (~11s)...", 1)
     scribe.polishTask = hs.task.new(PYTHON, function(exitCode, _, stderr)
-        setStatus(IDLE)
+        setMenuIdle()
         if exitCode == 0 then
             hs.eventtap.keyStroke({ "cmd" }, "v")
         else
