@@ -105,6 +105,16 @@ Other actions:
 - **Polish the last dictation** - `⌘⌥⌃P`, shown only if you enabled polish in setup. Runs the
   AI cleanup pass on the dictation you just made, about 10 seconds, without re-recording. Tip:
   undo the instant paste first, so the polished version replaces it rather than duplicating it.
+- **Prompt mode** - a radio group in the menu-bar dropdown, off by default. For stream-of-
+  thought dictations meant as instructions to an AI coding assistant: instead of pasting the
+  raw transcription, Scribe first has a fast Claude model rewrite it into a tight, structured
+  prompt, shaped for the target model you pick (Fable, Opus, or Sonnet, each following that
+  model's official prompting guidance). While armed, the pill shows the target's name under
+  the bars; after the typing dots, the three dots orbit while the rewrite runs, roughly ten
+  seconds. If the rewrite is unavailable, Scribe pastes the plain transcription and says so.
+  Requires the Claude CLI, like the polish pass. The point is context economy: the rewrite
+  happens before the text enters your assistant's context, so the rambling version never
+  costs you tokens there.
 - **Streaming mode (beta)** - a checkbox in the menu-bar dropdown, off by default. While you
   talk, Scribe transcribes at your natural pauses in the background, so only a short tail is
   left once you release the key. In the maintainer's own testing, this was about a third
@@ -223,10 +233,10 @@ used by the recall hotkey). Neither is deleted automatically; each is simply ove
 your next dictation. Transcripts also sit on the macOS clipboard after every dictation.
 Nothing is sent anywhere by default.
 
-**The one optional network flow of dictated content.** If you enable the AI polish pass, the
-*text* of a dictation (never the audio) is sent to Anthropic's Claude through your own,
-locally installed Claude CLI, under your own account and subject to its own terms. It is off
-by default, opt-in during setup, and only runs when you invoke it.
+**The one optional network flow of dictated content.** If you enable the AI polish pass or
+prompt mode, the *text* of a dictation (never the audio) is sent to Anthropic's Claude
+through your own, locally installed Claude CLI, under your own account and subject to its
+own terms. Both are off by default and only run when you invoke them.
 
 **Other network traffic.** A one-time model download from Hugging Face at install time, and
 Homebrew package installs. No telemetry, no analytics, no accounts, no update phone-home.

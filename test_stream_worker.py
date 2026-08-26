@@ -10,7 +10,7 @@ dictionary.json (the shipped one ships empty).
 
 Run: python3 test_stream_worker.py
 """
-import importlib.util, io, json, math, os, struct, subprocess, sys, tempfile
+import importlib.util, io, json, math, os, stat, struct, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -540,6 +540,173 @@ _stderr, sys.stderr = sys.stderr, io.StringIO()
 check_raises("a --language carrying curl's @ sigil is refused", SystemExit,
              sw.main, ["--from-file", os.path.join(FIXTURES, "hdr.wav"), "--language", "@/tmp/x"])
 sys.stderr = _stderr
+
+
+# --- 6c. prompt mode: the rewrite happens in the finish path, after the merge --------------
+# The optimizer itself is pipeline's, and pipeline's own tests cover its prompt, its isolation
+# and its sanitizer. What matters here is the worker's half of the contract: the finalized
+# text is what gets rewritten, the phase marker lands on the worker's own stdout, the rewrite
+# is what gets emitted and copied, and a failed rewrite still emits the words and returns 4.
+
+class DoneTranscriber:
+    """A finished ChunkTranscriber stand-in. _finish only drains it and reads its results."""
+
+    def __init__(self, texts):
+        self._texts = list(texts)
+        self.error = None
+
+    def finish(self):
+        pass
+
+    def texts_in_order(self, count):
+        return self._texts[:count]
+
+
+class FinishedSession:
+    """The two attributes _finish reads off a StreamSession once recording is over."""
+
+    def __init__(self, chunk_count):
+        self.chunk_count = chunk_count
+        self.cuts = []
+
+
+def finish_capturing(texts, optimize_for=None, cfg=None, copy=False):
+    """Run _finish over stubbed chunks. Returns (exit code, worker stdout, worker stderr)."""
+    saved_out, saved_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+    try:
+        code = sw._finish(FinishedSession(len(texts)), DoneTranscriber(texts), cfg or CFG,
+                          copy, False, time.time(), {}, optimize_for=optimize_for)
+        return code, sys.stdout.getvalue(), sys.stderr.getvalue()
+    finally:
+        sys.stdout, sys.stderr = saved_out, saved_err
+
+
+_saved_optimize = sw.pipeline.optimize_prompt
+REWRITE = "Context: a parser.\n\nTask: accept both formats."
+
+_never_called = []
+sw.pipeline.optimize_prompt = lambda text, cfg, target: _never_called.append(target)
+_plain_code, _plain_out, _plain_err = finish_capturing(["plain dictation"])
+check("without --optimize-for nothing is rewritten and the transcript is emitted",
+      (_plain_code, _never_called, _plain_out), (0, [], "plain dictation\n"))
+
+_opt_calls = []
+
+
+def _fake_optimize(text, cfg, target):
+    _opt_calls.append((text, target))
+    return REWRITE
+
+
+sw.pipeline.optimize_prompt = _fake_optimize
+_ok_code, _ok_out, _ok_err = finish_capturing(["  the parser  ", "should take both formats"],
+                                              optimize_for="opus")
+check("prompt mode exits 0 when the rewrite succeeds", _ok_code, 0)
+check("the optimizer is handed the merged, cleaned text and the chosen target",
+      _opt_calls, [("the parser should take both formats", "opus")])
+check("the rewrite is what the worker emits, not the transcript", _ok_out, REWRITE + "\n")
+check("the emitted rewrite keeps its blank line", "\n\n" in _ok_out, True)
+
+_opt_calls[:] = []
+_collapsed_code, _collapsed_out, _ = finish_capturing(
+    ["That is a partner.", "That is a partner."], optimize_for="fable")
+check("the merge still collapses the transcript before the rewrite sees it",
+      _opt_calls, [("That is a partner.", "fable")])
+
+_copied = []
+_saved_copy = sw.pipeline.copy_to_clipboard
+sw.pipeline.copy_to_clipboard = lambda text: (_copied.append(text), True)[1]
+_copy_code, _copy_out, _ = finish_capturing(["the parser"], optimize_for="sonnet", copy=True)
+check("the rewrite is what reaches the clipboard", (_copy_code, _copied), (0, [REWRITE]))
+
+# Fallback: the rewrite could not be produced. The words must still be emitted and copied.
+sw.pipeline.optimize_prompt = lambda text, cfg, target: None
+_copied[:] = []
+_fb_code, _fb_out, _fb_err = finish_capturing(["keep my words"], optimize_for="opus", copy=True)
+check("a failed rewrite returns the fallback exit code", _fb_code, sw.EXIT_OPTIMIZER_FALLBACK)
+check("the worker and pipeline agree on the fallback code",
+      (sw.EXIT_OPTIMIZER_FALLBACK, p.EXIT_OPTIMIZER_FALLBACK), (4, 4))
+check("a failed rewrite still emits the raw transcription", _fb_out, "keep my words\n")
+check("a failed rewrite still copies the raw transcription", _copied, ["keep my words"])
+
+# A stale clipboard outranks the fallback code: the caller must not paste at all.
+sw.pipeline.copy_to_clipboard = lambda text: False
+_stale_code, _stale_out, _ = finish_capturing(["keep my words"], optimize_for="opus", copy=True)
+check("a failed clipboard copy still wins over the fallback code", _stale_code, sw.EXIT_FAIL)
+sw.pipeline.copy_to_clipboard = _saved_copy
+
+# Through the real optimizer with a fake CLI: the marker must land on the worker's own stdout,
+# the same channel dictate.lua already reads MIC_READY and the LEVEL meters from.
+sw.pipeline.optimize_prompt = _saved_optimize
+FAKE_BIN = tempfile.mkdtemp(prefix="scribe-test-bin-")
+
+
+def write_script(name, body):
+    path = os.path.join(FAKE_BIN, name)
+    with open(path, "w") as fh:
+        fh.write("#!/bin/sh\n" + body)
+    os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+_worker_claude = write_script("optimize-claude",
+                              'cat > /dev/null\n'
+                              'printf "Context: a parser.\\n\\nTask: accept both formats.\\n"\n')
+OPT_CFG = dict(CFG, claude_bin=_worker_claude, claude_model="claude-haiku-4-5-20251001")
+_marker_code, _marker_out, _marker_err = finish_capturing(
+    ["so make the parser take both formats"], optimize_for="fable", cfg=OPT_CFG)
+check("prompt mode through the real optimizer exits 0", _marker_code, 0)
+check("the worker prints the OPTIMIZING marker on its own stdout, first",
+      _marker_out.splitlines()[0], p.PHASE_OPTIMIZING)
+check("the rewrite follows the marker on the same stdout",
+      "\n".join(_marker_out.splitlines()[1:]), REWRITE)
+
+_missing_claude_cfg = dict(CFG, claude_bin=os.path.join(FAKE_BIN, "no-such-claude"),
+                           claude_model="claude-haiku-4-5-20251001")
+_gone_code, _gone_out, _gone_err = finish_capturing(["keep my words"], optimize_for="opus",
+                                                    cfg=_missing_claude_cfg)
+check("a missing claude CLI is a fallback, not a crash", _gone_code, sw.EXIT_OPTIMIZER_FALLBACK)
+check("no marker is printed when the CLI is never invoked", _gone_out, "keep my words\n")
+
+
+# --- 6d. prompt mode: the flag plumbs from the command line into both run modes -------------
+def plumbed_optimize_for(argv, attr):
+    """Replace run_file/run_live with a spy, run main(argv), return what it was handed."""
+    seen = {}
+
+    def spy(source, cfg, copy=False, timings=False, optimize_for=None):
+        seen["source"], seen["optimize_for"] = source, optimize_for
+        return 0
+
+    saved = getattr(sw, attr)
+    setattr(sw, attr, spy)
+    try:
+        seen["code"] = sw.main(argv)
+    finally:
+        setattr(sw, attr, saved)
+    return seen
+
+
+_HDR_WAV = os.path.join(FIXTURES, "hdr.wav")
+_file_plumb = plumbed_optimize_for(["--from-file", _HDR_WAV, "--optimize-for", "sonnet"],
+                                   "run_file")
+check("--optimize-for reaches file mode", _file_plumb["optimize_for"], "sonnet")
+check("file mode still gets its source and exit code",
+      (_file_plumb["source"], _file_plumb["code"]), (_HDR_WAV, 0))
+_live_plumb = plumbed_optimize_for(["--mic", "3", "--optimize-for", "fable"], "run_live")
+check("--optimize-for reaches live mode", _live_plumb["optimize_for"], "fable")
+check("live mode still gets its microphone index", _live_plumb["source"], "3")
+check("omitting --optimize-for leaves the rewrite off",
+      plumbed_optimize_for(["--from-file", _HDR_WAV], "run_file")["optimize_for"], None)
+
+_stderr, sys.stderr = sys.stderr, io.StringIO()
+check_raises("an unknown --optimize-for target is refused", SystemExit,
+             sw.main, ["--from-file", _HDR_WAV, "--optimize-for", "gpt"])
+_bad_target_err = sys.stderr.getvalue()
+sys.stderr = _stderr
+check("the unknown-target error lists the accepted targets",
+      all(t in _bad_target_err for t in p.OPTIMIZE_TARGETS), True)
 
 
 # --- 7. integration: file mode must match the batch path exactly -------------------------

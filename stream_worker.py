@@ -4,6 +4,7 @@ still talking, and finish fast on key release.
 
 Usage:
     stream_worker.py --mic INDEX [--language en] [--copy] [--timings]
+                     [--optimize-for fable|opus|sonnet]
     stream_worker.py --from-file PATH [--language en] [--copy] [--timings]  # same logic, no microphone
 
 Architecture: "rolling handoff, never force-cut".
@@ -25,8 +26,16 @@ Two measured facts shape every decision here:
     happens ONLY at a detected silence; if there is no silence, nothing is handed off and
     the run simply degrades to plain batch behaviour.
 
+Prompt mode (--optimize-for): after the chunks are merged and cleaned, the text is rewritten
+into a prompt aimed at one target model (fable, opus, sonnet) by pipeline.optimize_prompt,
+and that rewrite is what is emitted and copied. The worker prints the OPTIMIZING phase marker
+on its own stdout, the same channel MIC_READY and the LEVEL meters already use, immediately
+before the rewriting CLI starts.
+
 Exit codes: 0 success (text on stdout and, with --copy, on the clipboard), 3 nothing was
-captured (dictate.lua treats this as an aborted dictation: no paste, no error), 1 failure.
+captured (dictate.lua treats this as an aborted dictation: no paste, no error), 1 failure,
+4 the rewrite asked for by --optimize-for was unavailable so the RAW cleaned transcription
+was emitted and copied instead (the words are never lost, only left un-rewritten).
 
 Every run appends timestamped lines to the shared Scribe log (pipeline.log).
 """
@@ -91,6 +100,7 @@ LEVEL_QUEUE_MAX = 256
 
 EXIT_EMPTY = 3                             # nothing captured; dictate.lua resets quietly
 EXIT_FAIL = 1
+EXIT_OPTIMIZER_FALLBACK = 4                # same meaning as pipeline.EXIT_OPTIMIZER_FALLBACK
 
 
 def pcm_path():
@@ -609,7 +619,7 @@ def _report_levels_dropped(dropped):
         log("dropped %d meter reading(s): the stdout reader could not keep up" % dropped)
 
 
-def run_live(mic_index, cfg, copy=False, timings=False):
+def run_live(mic_index, cfg, copy=False, timings=False, optimize_for=None):
     stop = threading.Event()
 
     def on_signal(_signum, _frame):
@@ -699,7 +709,8 @@ def run_live(mic_index, cfg, copy=False, timings=False):
     session.close_tail()
     code = _finish(session, transcriber, cfg, copy, timings, t_release,
                    extra={"mic_ready": (t_ready - t_start) if t_ready else 0.0,
-                          "record": total})
+                          "record": total},
+                   optimize_for=optimize_for)
     if own_pcm:
         _quiet_remove(own_pcm)
     return code
@@ -725,7 +736,7 @@ def _stop_ffmpeg(proc, grace=5.0):
 # File mode
 # --------------------------------------------------------------------------------------
 
-def run_file(src, cfg, copy=False, timings=False):
+def run_file(src, cfg, copy=False, timings=False, optimize_for=None):
     """Replay the live handoff logic over a recorded file, as if released at EOF."""
     if not os.path.exists(src):
         sys.stderr.write("input file not found: %s\n" % src)
@@ -766,7 +777,8 @@ def run_file(src, cfg, copy=False, timings=False):
     t_release = time.time()
     session.close_tail()
     code = _finish(session, transcriber, cfg, copy, timings, t_release,
-                   extra={"decode": t_release - t_start, "record": total})
+                   extra={"decode": t_release - t_start, "record": total},
+                   optimize_for=optimize_for)
     _quiet_remove(path)
     return code
 
@@ -775,7 +787,7 @@ def run_file(src, cfg, copy=False, timings=False):
 # Shared finish
 # --------------------------------------------------------------------------------------
 
-def _finish(session, transcriber, cfg, copy, timings, t_release, extra):
+def _finish(session, transcriber, cfg, copy, timings, t_release, extra, optimize_for=None):
     transcriber.finish()
     if transcriber.error is not None:
         log("FAIL %s (audio kept at %s)" % (transcriber.error, transcriber.error.wav_path))
@@ -791,6 +803,16 @@ def _finish(session, transcriber, cfg, copy, timings, t_release, extra):
         log("EMPTY: nothing transcribed from %d chunk(s)" % session.chunk_count)
         return EXIT_EMPTY
 
+    code = 0
+    if optimize_for:
+        optimized = pipeline.optimize_prompt(text, cfg, optimize_for)
+        if optimized:
+            text = optimized
+        else:
+            # Emit the raw cleaned transcription anyway: a failed rewrite must never cost the
+            # user their words. The exit code is the only signal that it was not rewritten.
+            code = EXIT_OPTIMIZER_FALLBACK
+
     copied = emit(text, copy=copy)
     if timings:
         parts = ["%s=%.2fs" % (k, v) for k, v in sorted(extra.items())]
@@ -800,7 +822,7 @@ def _finish(session, transcriber, cfg, copy, timings, t_release, extra):
         sys.stderr.write("timings: " + ", ".join(parts) + "\n")
     if not copied:
         return EXIT_FAIL                    # clipboard is stale; the caller must not paste
-    return 0
+    return code
 
 
 def main(argv=None):
@@ -811,6 +833,11 @@ def main(argv=None):
     ap.add_argument("--language", help="transcription language code; overrides config.json")
     ap.add_argument("--copy", action="store_true", help="also copy the result to the clipboard")
     ap.add_argument("--timings", action="store_true", help="print per-stage timings to stderr")
+    ap.add_argument("--optimize-for", choices=list(pipeline.OPTIMIZE_TARGETS),
+                    dest="optimize_for",
+                    help="rewrite the dictation into a prompt aimed at this model instead of "
+                         "emitting the transcript; exits %d if the rewrite is unavailable"
+                         % EXIT_OPTIMIZER_FALLBACK)
     args = ap.parse_args(argv)
     if bool(args.mic) == bool(args.from_file):
         ap.error("give exactly one of --mic or --from-file")
@@ -829,11 +856,15 @@ def main(argv=None):
         if not pipeline.is_valid_language(args.language):
             ap.error('--language must be a 2-3 letter code such as "en" or "da", or "auto"')
         cfg["language"] = args.language
-    log("start mode=%s source=%s" % (mode, args.from_file or args.mic))
+    log("start mode=%s source=%s%s"
+        % (mode, args.from_file or args.mic,
+           (" optimize-for=%s" % args.optimize_for) if args.optimize_for else ""))
     if args.from_file:
-        code = run_file(args.from_file, cfg, copy=args.copy, timings=args.timings)
+        code = run_file(args.from_file, cfg, copy=args.copy, timings=args.timings,
+                        optimize_for=args.optimize_for)
     else:
-        code = run_live(args.mic, cfg, copy=args.copy, timings=args.timings)
+        code = run_live(args.mic, cfg, copy=args.copy, timings=args.timings,
+                        optimize_for=args.optimize_for)
     log("end mode=%s exit=%d %.2fs" % (mode, code, time.time() - started))
     return code
 

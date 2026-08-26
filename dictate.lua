@@ -28,7 +28,7 @@ if scribe then
     if scribe.menu then scribe.menu:delete() end
     if scribe.cueTimer then scribe.cueTimer:stop() end
     if scribe.batchTimeout then scribe.batchTimeout:stop() end
-    if scribe.animTimer then scribe.animTimer:stop() end          -- HUD morph / typing bounce
+    if scribe.animTimer then scribe.animTimer:stop() end          -- HUD morph / typing bounce / optimizing orbit
     if scribe.menuAnimTimer then scribe.menuAnimTimer:stop() end   -- menu-bar glyph animation
     if scribe.hud then scribe.hud:delete() end
     if scribe.recTask then pcall(function() scribe.recTask:terminate() end) end
@@ -41,6 +41,7 @@ scribe.transcribing = false     -- a transcription is in flight; a new recording
 scribe.micIndex = nil           -- resolved by name below; nil means "do not record"
 scribe.micName = nil            -- the name we are looking for, for error messages
 scribe.workerPid = nil          -- PID of the streaming worker, so we signal only ours
+scribe.optimizing = false       -- the prompt rewrite has started for the dictation in flight
 
 local HOME        = os.getenv("HOME")
 local SCRIBE_HOME = HOME .. "/.config/scribe"
@@ -105,6 +106,29 @@ scribe.micName = configString(cfg.mic_name)
 scribe.streaming = hs.settings.get("scribe.streaming")
 if scribe.streaming == nil then scribe.streaming = false end
 
+-- Prompt mode: when armed, the Python side rewrites the finished transcription into a prompt
+-- aimed at the chosen model before it reaches the clipboard. Persisted like the streaming
+-- toggle; "off" is the default and leaves every existing path byte-identical.
+local PROMPT_TARGETS = { "off", "fable", "opus", "sonnet" }   -- also the menu order
+local PROMPT_LABELS = {
+    off    = "Off",
+    fable  = "Optimize for Fable",
+    opus   = "Optimize for Opus",
+    sonnet = "Optimize for Sonnet",
+}
+local PROMPT_BADGES = { fable = "FABLE", opus = "OPUS", sonnet = "SONNET" }   -- no entry for "off"
+
+-- A value read back from hs.settings could be anything (a hand-edited plist, an older build),
+-- and it is about to become a command-line argument. Anything unrecognised means "off".
+local function normalizePromptTarget(value)
+    for _, target in ipairs(PROMPT_TARGETS) do
+        if value == target then return value end
+    end
+    return "off"
+end
+
+scribe.promptTarget = normalizePromptTarget(hs.settings.get("scribe.promptTarget"))
+
 local function log(message)
     print("[Scribe] " .. message)
 end
@@ -161,6 +185,22 @@ local PILL_W, PILL_H = 130, 68
 local MIN_BAR_H, MAX_BAR_H = 9, 40
 local DOT_D = 8
 
+-- Armed badge: a small uppercase model name near the pill's bottom edge, shown only while
+-- prompt mode is armed. Faint by design; it is a reminder, not a second thing to read.
+local BADGE_SIZE = 10
+local BADGE_H    = 12
+local BADGE_Y    = PILL_H - 15
+
+-- hs.canvas wants a font NAME, and the bold system font's real name is not a stable literal
+-- across macOS releases, so ask hs.styledtext for it. Helvetica-Bold ships with every macOS
+-- and covers the case where that lookup ever changes shape; a missing key must not be able to
+-- break HUD construction.
+local BADGE_FONT = "Helvetica-Bold"
+do
+    local ok, name = pcall(function() return hs.styledtext.defaultFonts.boldSystem.name end)
+    if ok and type(name) == "string" and name ~= "" then BADGE_FONT = name end
+end
+
 local function barFrame(i, h)
     local totalW = BAR_COUNT * BAR_W + (BAR_COUNT - 1) * BAR_GAP
     local startX = (PILL_W - totalW) / 2
@@ -173,8 +213,10 @@ local function screenCenterFrame(w, h)
     return { x = f.x + (f.w - w) / 2, y = f.y + (f.h - h) / 2 - 60, w = w, h = h }
 end
 
--- Build the HUD once (index 1 = pill background, 2..4 = the three bars/dots). Reused across
--- every dictation rather than recreated, so there is no per-dictation canvas-allocation cost.
+-- Build the HUD once (index 1 = pill background, 2..4 = the three bars/dots, 5 = the armed
+-- badge). Reused across every dictation rather than recreated, so there is no per-dictation
+-- canvas-allocation cost. The badge is built in every time and blanked when prompt mode is off
+-- rather than inserted and removed, so the bar indices setBar() writes to can never shift.
 local function makeHUD()
     local c = hs.canvas.new(screenCenterFrame(PILL_W, PILL_H))
     c:level(hs.canvas.windowLevels.overlay)
@@ -194,8 +236,22 @@ local function makeHUD()
             roundedRectRadii = { xRadius = BAR_W / 2, yRadius = BAR_W / 2 },
             frame = barFrame(i, MIN_BAR_H) }
     end
+    elems[#elems + 1] = { type = "text", text = "",
+        textColor = { white = 1, alpha = 0.45 },
+        textSize = BADGE_SIZE, textFont = BADGE_FONT, textAlignment = "center",
+        frame = { x = 0, y = BADGE_Y, w = PILL_W, h = BADGE_H } }
     c:replaceElements(elems)
     return c
+end
+
+-- The badge sits one past the last bar; setBar() owns 2..4 and is untouched by this.
+local BADGE_INDEX = BAR_COUNT + 2
+
+-- nil (the "off" case, since PROMPT_BADGES has no "off" key) blanks the label rather than
+-- removing the element.
+local function setBadge(label)
+    if not scribe.hud then return end
+    scribe.hud:elementAttribute(BADGE_INDEX, "text", label or "")
 end
 
 local function setBar(i, frame, isDot)
@@ -210,6 +266,9 @@ end
 local function showHUD()
     if not scribe.hud then scribe.hud = makeHUD() end
     for i = 1, BAR_COUNT do setBar(i, barFrame(i, MIN_BAR_H), false) end
+    -- The LATCHED target, not the live menu value: the badge must say what this dictation will
+    -- actually do. It stays up through the whole lifecycle, optimizing included.
+    setBadge(PROMPT_BADGES[scribe.activePromptTarget])
     scribe.hud:alpha(1)
     scribe.hud:show()
 end
@@ -329,6 +388,35 @@ local function startTypingBounce()
             local base = barFrame(i, DOT_D)
             base.y = base.y - lifted
             setBar(i, base, true)
+        end
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Optimizing animation: the same three dots leave their row and orbit the
+-- pill's center, 120 degrees apart, one revolution per 1.8s. Deliberately a
+-- different KIND of motion from the typing bounce, so "still transcribing" and
+-- "rewriting your prompt" are told apart at a glance rather than by speed.
+-- ---------------------------------------------------------------------------
+
+local ORBIT_RADIUS, ORBIT_PERIOD = 14, 1.8
+
+local function startOrbit()
+    -- One animation timer at a time, as everywhere else here: reusing animTimer means every
+    -- existing stop path (finishTranscription, the reload cleanup, the recorder-died branch)
+    -- already stops this one too.
+    if scribe.animTimer then scribe.animTimer:stop() end
+    local cx, cy = PILL_W / 2, PILL_H / 2
+    local step = 2 * math.pi / BAR_COUNT   -- 120 degrees between dots
+    local t0 = hs.timer.secondsSinceEpoch()
+    scribe.animTimer = hs.timer.doEvery(0.03, function()
+        local t = hs.timer.secondsSinceEpoch() - t0
+        local base = ((t % ORBIT_PERIOD) / ORBIT_PERIOD) * 2 * math.pi
+        for i = 1, BAR_COUNT do
+            local angle = base + (i - 1) * step
+            setBar(i, { x = cx + ORBIT_RADIUS * math.cos(angle) - DOT_D / 2,
+                        y = cy + ORBIT_RADIUS * math.sin(angle) - DOT_D / 2,
+                        w = DOT_D, h = DOT_D }, true)
         end
     end)
 end
@@ -646,9 +734,22 @@ end
 -- the menu-bar state. Errors still speak for themselves through alertProblem.
 local function finishTranscription()
     scribe.transcribing = false
+    scribe.optimizing = false
     if scribe.animTimer then scribe.animTimer:stop() end
     hideHUD(true)
     setMenuIdle()
+end
+
+-- The Python side prints a flushed OPTIMIZING line when the prompt rewrite begins (pipeline
+-- stdout in batch, worker stdout in streaming). Swap the typing bounce for the orbit; the menu
+-- bar keeps its existing transcribing state, which already reads as "working".
+-- Guarded twice: once so a marker arriving while the mic is still open cannot fight the level
+-- bars for the same frames, and once so a repeated marker does not restart the orbit mid-turn.
+local function enterOptimizing()
+    if scribe.recording or scribe.optimizing then return end
+    scribe.optimizing = true
+    startOrbit()
+    setMenuTranscribing()
 end
 
 -- ---------------------------------------------------------------------------
@@ -670,18 +771,36 @@ local function transcribeAndPaste()
     --   --not-older-than  refuses a WAV written before this recording started, so a recorder
     --                     that silently failed cannot get the PREVIOUS dictation pasted.
     --   --consume         deletes the WAV once it has been read, so it cannot be reused.
+    local args = { PIPELINE, WAV, "--copy", "--consume",
+                   "--not-older-than", string.format("%d", scribe.sessionStart or 0) }
+    -- The LATCHED target, so a menu change made during transcription cannot redirect the run
+    -- that is already under way.
+    if scribe.activePromptTarget and scribe.activePromptTarget ~= "off" then
+        args[#args + 1] = "--optimize-for"
+        args[#args + 1] = scribe.activePromptTarget
+    end
     scribe.pipeTask = hs.task.new(PYTHON, function(exitCode, _, stderr)
         finishTranscription()
         if exitCode == 0 then
             hs.eventtap.keyStroke({ "cmd" }, "v")
+        elseif exitCode == 4 then
+            -- The text IS on the clipboard and ready to paste, it is just the raw
+            -- transcription: the optimizer could not run. Paste exactly as for 0, then say so.
+            hs.eventtap.keyStroke({ "cmd" }, "v")
+            alertProblem("prompt optimizer unavailable, pasted the raw transcription", 2.5)
+            log("pipeline stderr: " .. (stderr or ""))
         elseif exitCode == 3 then
             return                                                -- nothing was said: reset quietly
         else
             alertProblem("dictation failed (see console)", 2)
             log("pipeline error: " .. (stderr or ""))
         end
-    end, { PIPELINE, WAV, "--copy", "--consume",
-           "--not-older-than", string.format("%d", scribe.sessionStart or 0) })
+    end,
+    function(_, stdOut, _)                                        -- stream callback: the phase marker
+        if stdOut and stdOut:find("OPTIMIZING") then enterOptimizing() end
+        return true
+    end,
+    args)
     scribe.pipeTask:start()
 end
 
@@ -754,6 +873,12 @@ local function streamWorkerFinished(exitCode, _, stderr)
     finishTranscription()
     if exitCode == 0 then
         hs.eventtap.keyStroke({ "cmd" }, "v")
+    elseif exitCode == 4 then
+        -- Same contract as the batch path: pasted-ready, but raw, because the optimizer was
+        -- unavailable.
+        hs.eventtap.keyStroke({ "cmd" }, "v")
+        alertProblem("prompt optimizer unavailable, pasted the raw transcription", 2.5)
+        log("stream worker stderr: " .. (stderr or ""))
     elseif exitCode == 3 then
         return                                                     -- empty/aborted dictation: reset quietly
     else
@@ -777,6 +902,10 @@ local function startRecording()
     -- Latch the mode for this whole recording. Toggling streaming from the menu mid-recording
     -- must not send the release down the other branch.
     scribe.activeStreaming = scribe.streaming
+    -- Same latch for the prompt-mode target, for the same reason: the badge, the argv and the
+    -- OPTIMIZING phase all have to agree with each other for the whole of THIS dictation.
+    scribe.activePromptTarget = scribe.promptTarget
+    scribe.optimizing = false
     if scribe.activeStreaming and not PYTHON then
         alertProblem("python3 not found, run install.sh again", 4)
         return
@@ -798,15 +927,21 @@ local function startRecording()
         -- The worker owns ffmpeg internally; dictate.lua only starts it, watches stdout for the
         -- ready cue and the LEVEL lines that drive the HUD, and signals it to stop. It
         -- transcribes, copies to the clipboard, and exits.
+        local workerArgs = { WORKER_PATH, "--mic", scribe.micIndex, "--copy" }
+        if scribe.activePromptTarget ~= "off" then
+            workerArgs[#workerArgs + 1] = "--optimize-for"
+            workerArgs[#workerArgs + 1] = scribe.activePromptTarget
+        end
         scribe.recTask = hs.task.new(PYTHON, streamWorkerFinished,
-            function(_, stdOut, _)                                 -- stream callback: cue, then levels
+            function(_, stdOut, _)                                 -- stream callback: cue, levels, phase
                 if stdOut then
                     if stdOut:find("MIC_READY") then cueSpeak() end
+                    if stdOut:find("OPTIMIZING") then enterOptimizing() end
                     feedWorkerChunk(stdOut)                        -- "LEVEL <band> <dB>" -> HUD bars
                 end
                 return true
             end,
-            { WORKER_PATH, "--mic", scribe.micIndex, "--copy" })
+            workerArgs)
     else
         -- Delete first, so a recorder that never produces a file cannot leave the previous
         -- dictation lying here to be transcribed and pasted as if it were new. The session
@@ -944,6 +1079,21 @@ local function buildMenu()
         buildMenu()
         hs.alert.show(scribe.streaming and "Streaming mode ON" or "Streaming mode OFF", 1)
     end }
+    -- Radio group: exactly one target is armed at a time, so these are mutually exclusive
+    -- checkmarks rather than four independent toggles. Same persist-then-rebuild pattern as
+    -- the streaming toggle above.
+    items[#items + 1] = { title = "Prompt mode", disabled = true }
+    for _, target in ipairs(PROMPT_TARGETS) do
+        items[#items + 1] = { title = PROMPT_LABELS[target],
+            checked = (scribe.promptTarget == target),
+            fn = function()
+                scribe.promptTarget = target
+                hs.settings.set("scribe.promptTarget", target)
+                buildMenu()
+                hs.alert.show(target == "off" and "Prompt mode OFF"
+                    or ("Prompt mode: " .. PROMPT_LABELS[target]), 1)
+            end }
+    end
     items[#items + 1] = { title = "-" }
     items[#items + 1] = { title = "Reload Scribe config", fn = function() hs.reload() end }
     items[#items + 1] = { title = "Open Hammerspoon Console", fn = function() hs.openConsole() end }

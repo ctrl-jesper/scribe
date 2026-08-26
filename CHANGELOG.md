@@ -2,6 +2,17 @@
 
 All notable changes to Scribe are documented in this file.
 
+## [0.3.0] - 2026-08-26
+
+### Added
+
+- Prompt mode: dictate a stream-of-thought request and Scribe rewrites it into a tight,
+  structured prompt before pasting, shaped for your chosen target model (Fable, Opus, or
+  Sonnet) following each model's official prompting guidance. Armed via a radio group in the
+  menu; the pill shows the target name while recording and the dots orbit during the rewrite.
+  If the rewriter is unavailable, the plain transcription is pasted and a notice says so.
+  Uses the same local Claude CLI as the polish pass; text only, never audio, off by default.
+
 ## [0.2.0] - 2026-08-26
 
 ### Added
