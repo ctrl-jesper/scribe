@@ -1492,10 +1492,19 @@ def optimizer_blocked_reason(cfg):
 
     Deliberately does NOT consult "polish_enabled": that setting governs the automatic
     cleanup pass, while --optimize-for is an explicit request for this one run.
+
+    Executability is checked, not just existence, for the same reason polish_blocked_reason
+    checks it: a claude_bin that exists but cannot be run (wrong permissions, a directory, a
+    stale wrapper) would otherwise raise OSError out of subprocess.run. On the streaming path
+    that is the difference between "pasted raw" and losing the dictation, because emit() does
+    not run until after this call returns.
     """
     claude_bin = os.path.expanduser(cfg["claude_bin"])
     if not os.path.exists(claude_bin):
         return "claude CLI not found at %s; set \"claude_bin\" in %s" % (claude_bin, CONFIG_PATH)
+    if not os.access(claude_bin, os.X_OK):
+        return ("claude CLI at %s is not executable; fix its permissions or set \"claude_bin\" "
+                "in %s" % (claude_bin, CONFIG_PATH))
     return None
 
 
@@ -1574,6 +1583,14 @@ def optimize_prompt(text, cfg, target, status=None):
         log("optimizer fallback: claude -p timed out after %.0fs" % OPTIMIZER_TIMEOUT_S)
         sys.stderr.write("[optimize fallback] claude -p timed out after %.0fs\n"
                          % OPTIMIZER_TIMEOUT_S)
+        return None
+    except OSError as exc:
+        # The CLI passed optimizer_blocked_reason a moment ago but still could not be executed
+        # (replaced, unmounted, a bad interpreter line). Falling back keeps the dictation;
+        # letting OSError escape would lose it, because the streaming path persists nothing
+        # until this returns.
+        log("optimizer fallback: could not run %s: %s" % (cfg["claude_bin"], exc))
+        sys.stderr.write("[optimize fallback] could not run the claude CLI: %s\n" % exc)
         return None
     finally:
         shutil.rmtree(empty_cwd, ignore_errors=True)
