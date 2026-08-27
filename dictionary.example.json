@@ -2,5 +2,10 @@
   "_comment": "Deterministic, case-insensitive, word-boundary replacements applied to every transcript. Put ONLY unambiguous garbles here, never a spelling that is also a legitimate word in your own speech: the replacement has no context to fall back on. Ambiguous fixes belong to the optional LLM polish pass instead.",
   "replacements": {
     "Acme Korp": "Acme Corp"
+  },
+  "_phrases_comment": "Say a trigger phrase, get this saved block of text pasted verbatim instead. A sibling of \"replacements\", not merged into it: this text is never sent through the optional LLM polish or prompt-optimizer passes, and reaches the clipboard exactly as written, so it is the right place for standard boilerplate you want word-for-word, never for text you want cleaned up. Values may span multiple lines. Matching is case-insensitive and whole-phrase; saying the trigger alone (with whisper's own trailing period) still expands cleanly.",
+  "phrases": {
+    "standard engagement caveat": "This engagement is provided on our standard consulting terms and does not constitute financial advice.",
+    "insert signature": "Best regards,\nYour Name Here"
   }
 }

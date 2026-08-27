@@ -41,6 +41,11 @@ Precedence, when both --optimize-for and --polish are given: the OPTIMIZER WINS 
 polish is skipped entirely. The rewrite already cleans up the same things the polish would,
 so running both would cost ~22s of LLM time for one dictation and throw half of it away.
 
+Phrases: after everything above (optimizer or polish, if either ran), each configured trigger
+phrase (dictionary.json's "phrases" object) is expanded into its saved block of text by
+pipeline.apply_phrases, immediately before the result is emitted and copied. Always last, and
+never sent through either LLM pass: see pipeline.py's "Phrases" section for why.
+
 Exit codes: 0 success (text on stdout and, with --copy, on the clipboard), 3 nothing was
 captured (dictate.lua treats this as an aborted dictation: no paste, no error), 1 failure,
 4 the rewrite asked for by --optimize-for was unavailable so the RAW cleaned transcription
@@ -873,6 +878,11 @@ def _finish(session, transcriber, cfg, copy, timings, t_release, extra, optimize
             code = EXIT_AUTH_NEEDED if status.get("auth_needed") else EXIT_OPTIMIZER_FALLBACK
     elif polish:
         text, code = _apply_polish(text, cfg)
+
+    # Phrase expansion runs last, after both the optimizer and the polish above, and right
+    # before emit(): see pipeline.py's "Phrases" section note for why (privacy, and a
+    # byte-for-byte guarantee an LLM pass would otherwise break).
+    text = pipeline.apply_phrases(text, pipeline.load_phrases())
 
     copied = emit(text, copy=copy)
     if timings:
