@@ -29,17 +29,20 @@ collapsing, optional AI polish (on demand or automatic), prompt mode (rewrites a
 stream-of-thought dictation into a prompt targeted at a specific model), streaming mode, and
 a voice-reactive HUD.
 
+Added in 0.5.0, all local and all without a new permission: **Latch** (tap a key while holding
+push-to-talk and it keeps recording hands-free), a cap on how long any single recording can
+run, **spoken punctuation** ("new paragraph" and friends, deterministic, no AI call),
+**Second thoughts** (spoken self-corrections such as "coffee at 2, actually 3", narrow by
+design because "actually" is an ordinary word), and **Phrases** (say a trigger, get a saved
+block of text, verbatim).
+
 ## Next: things that need no new permissions
 
 These need no new macOS permission and no new foundation. They are the near-term queue.
 
 | Feature | Size | What it is |
 |---|---|---|
-| **Snippets** | S | Say a trigger phrase, get a saved block of text. The existing replacement dictionary is most of the machinery; what is new is multi-line values and whole-word trigger matching. |
-| **Backtrack** | S-M | Resolve spoken self-corrections ("coffee at 2, actually 3" becomes "coffee at 3") and false starts. Largely a prompt change to the existing polish pass, plus a cheap local heuristic for explicit trigger phrases so the common case costs no LLM call. |
-| **Transforms** | M | Select text anywhere, press a hotkey, and a named rule rewrites it in place (fix grammar, change tone, restructure). Several user-defined rules, each on its own shortcut. The selection can be read and replaced with a clipboard round trip, so this needs no accessibility permission. |
-| **Spoken punctuation and lists** | S | Say "comma", "new paragraph", or "one... two... three" and get the punctuation and the numbered list. Deterministic, no AI round trip. |
-| **Cancel in flight, hands-free lock** | S | Escape abandons a dictation in progress; a double press locks recording on so the key need not be held. Pure Hammerspoon, removes daily friction. |
+| **Recasts** | M | Select text anywhere, press a hotkey, and a named rule rewrites it in place (fix grammar, change tone, restructure). Several user-defined rules, each on its own shortcut. The selection can be read and replaced with a clipboard round trip, so this needs no accessibility permission. **Not agreed yet:** its only real advantage over pasting into an already-open Claude window is avoiding the app switch, so it is worth deciding whether that is worth an M before building it. |
 | **Language hotkey** | S | Switch dictation language without opening settings, and optionally bind a default language per application. Sidesteps the unsolved per-word code-switching problem by making the switch explicit and instant. |
 
 ## Then: one deliberate foundation, not four ad-hoc ones
@@ -67,6 +70,12 @@ Once it exists, these become incremental rather than each carrying their own plu
 - **Meeting recording and transcription.** A different product.
 - **True per-word code switching.** Unsolved by the commercial products too, whose language
   detection is per session rather than per word. The language hotkey covers the real need.
+- **Spoken numbered lists.** "one... two... three" becoming a numbered list sounds harmless and
+  is not: ordinary counting speech would trigger it constantly. Spoken punctuation ships
+  without it deliberately.
+- **Cancel in flight.** Escape abandoning a dictation in progress was considered and dropped:
+  the maintainer does not want it, and every other path in this project is built to never lose
+  words.
 - **Tone adaptation as competitors market it.** Their own documentation describes changing
   capitalization and punctuation, not tone. Scribe will ship the honest version or nothing.
 - **Benchmark chasing.** Accuracy claims measured by their author, with their methodology, on

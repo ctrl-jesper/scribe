@@ -205,6 +205,25 @@ Use it only for garbles that are never a legitimate word on their own; anything 
 (a word that could be either the garble or something you actually meant) belongs in the
 optional AI polish pass instead, which has context the dictionary does not.
 
+The same file holds `phrases`: say a trigger, get a saved block of text. Values may span
+several lines.
+
+```json
+{
+  "phrases": {
+    "standard engagement caveat": "This engagement is provided on our standard consulting terms and does not constitute financial advice.",
+    "insert signature": "Best regards,\nYour Name Here"
+  }
+}
+```
+
+Matching is case-insensitive and whole-phrase, so a trigger never fires inside a longer word,
+and saying a trigger on its own still expands cleanly despite the trailing period the
+transcriber adds. Expansion happens after the AI polish pass, so the saved text reaches the
+clipboard exactly as you wrote it rather than being reworded. The exception is prompt mode,
+where expansion happens first and the expanded text is therefore part of what goes to the
+Claude CLI, because in that mode your whole dictation is anyway.
+
 File locations:
 
 | Path | Contents |

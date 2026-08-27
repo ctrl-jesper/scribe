@@ -17,7 +17,7 @@ local too.
 
 ## Where things stand
 
-Shipped and public at github.com/ctrl-jesper/scribe, currently **v0.4.0**. The maintainer runs
+Shipped and public at github.com/ctrl-jesper/scribe, currently **v0.5.0**. The maintainer runs
 this exact codebase as his daily driver: his personal config lives in `~/.config/scribe/`
 (never in the repo), and `install.sh` upgrades him in place without touching it.
 
@@ -26,20 +26,37 @@ vocabulary boosting, correction dictionary, repetition-loop collapsing, on-deman
 automatic AI polish, prompt mode (rewrites rambling dictation into a prompt targeted at
 Fable/Opus/Sonnet), streaming mode, and a voice-reactive HUD with a matching menu-bar icon.
 
-438 test assertions across two suites, all passing. Run them before and after any change:
+Added in 0.5.0: hands-free recording (latch), a 15 minute cap on any single recording, spoken
+punctuation, second thoughts (spoken self-corrections), phrases (say a trigger, get a saved
+block), and CI.
+
+421 and 191 test assertions across the two suites, plus 42 selftest checks, all passing. Run
+them before and after any change:
 
     python3 test_pipeline.py && python3 test_stream_worker.py && python3 scribe_setup.py --selftest
 
+CI now runs both suites and parses `dictate.lua` with a real Lua 5.4 compiler on every push and
+pull request, which is the only genuine syntax check this project has ever had for the
+Hammerspoon script. Use it: push a branch and let it parse the Lua you cannot execute locally.
+
 ## What to build next
 
-`ROADMAP.md` has the full reasoning. The queue, in order, from a competitive review:
+`ROADMAP.md` has the full reasoning. Most of the original queue shipped in 0.5.0. What is left:
 
-1. **Snippets** (S) - say a trigger phrase, get a saved block of text.
-2. **Backtrack** (S-M) - resolve spoken self-corrections ("coffee at 2, actually 3").
-3. **Transforms** (M) - select text, hit a hotkey, a named rule rewrites it in place.
-4. **Spoken punctuation and lists** (S) - deterministic, no LLM call.
-5. **Cancel in flight, hands-free lock** (S) - Escape abandons; double-press locks recording on.
-6. **Language hotkey** (S) - switch dictation language without opening settings.
+1. **Recasts** (M) - select text anywhere, press a hotkey, a named rule rewrites it in place.
+   Was called Transforms. **Not started, and not yet agreed:** the maintainer asked whether it
+   earns its place given he already has Claude Desktop and Claude Code open all day, so the
+   only thing it buys is avoiding the app switch. Get his answer before building it.
+2. **Language hotkey** (S) - switch dictation language without opening settings. Directly
+   useful given he works in Danish and English daily.
+
+Deliberately dropped: cancel-in-flight (Escape to abandon a dictation), which he said he does
+not want, and spoken numbered lists, which are a false-positive machine.
+
+Naming, decided with him: the features are Phrases, Recasts, Second thoughts, and Latch, so
+they do not simply copy the competitor's names. Note that "latch" now means the hands-free
+lock and nothing else in `dictate.lua`; the older comments that used it for the frozen
+prompt-mode target were reworded to "frozen" precisely so the word means one thing.
 
 **The sequencing decision, already made:** several *later* features (proper nouns from screen
 context, mid-sentence capitalization, per-app formatting) all need the same thing: reading the
@@ -78,18 +95,24 @@ Hard-won, in roughly the order the lessons hurt:
 
 ## Known debt, recorded and not fixed
 
-- `optimizer_blocked_reason` does not check the CLI is *executable*, only that it exists. The
-  polish path was fixed; this one is the same hole, reachable from prompt mode.
+- `optimizer_blocked_reason` does not check the CLI is *executable*, only that it exists. A fix
+  exists on the `fix/optimizer-oserror-guard` branch, verified to merge cleanly, but it has not
+  been reviewed or merged. Check whether it landed before re-fixing it.
 - Streaming writes the polished text to `last-dict.txt` while batch keeps the pre-polish
   transcript, so the polish hotkey after a streaming auto-polish re-polishes polished text.
   Fixing it means changing `emit()`, which is a live-verified path.
-- `dictate.lua` has no automated parse check anywhere. A syntax error there breaks every
-  user's hotkey at once. A CI job running `luac -p` would close the largest single risk in
-  the project.
-- Repo scaffolding never finished: no SECURITY.md, private vulnerability reporting still
-  disabled on GitHub, no issue template, no CI, no topics set, no demo GIF. Drafts for most of
-  these exist from an earlier audit.
+- Two spoken "new paragraph" commands in a row produce four newlines rather than collapsing to
+  one break: whisper inserts a comma between them, which defeats the repetition collapser's
+  exact-token match. Minor, and a robust fix needs its own design decision.
+- Second thoughts supports single-word written numbers ("two", "three") but not compounds
+  ("twenty-three"). Documented in the code, not fixed.
+- Repo scaffolding still unfinished: no SECURITY.md, private vulnerability reporting still
+  disabled on GitHub, no issue template, no topics set, no demo GIF. CI now exists. Drafts for
+  most of the rest exist from an earlier audit.
 - Intel support is implemented but has never run on Intel hardware.
+- The 0.5.0 Lua changes (latch, the recording cap, the menu-bar marker) parse under a real Lua
+  compiler in CI, but their runtime behaviour was confirmed only by the maintainer reloading
+  Hammerspoon. If something about the gesture or the timer misbehaves, that is where to look.
 
 ## The maintainer
 

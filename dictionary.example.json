@@ -3,7 +3,7 @@
   "replacements": {
     "Acme Korp": "Acme Corp"
   },
-  "_phrases_comment": "Say a trigger phrase, get this saved block of text pasted verbatim instead. A sibling of \"replacements\", not merged into it: this text is never sent through the optional LLM polish or prompt-optimizer passes, and reaches the clipboard exactly as written, so it is the right place for standard boilerplate you want word-for-word, never for text you want cleaned up. Values may span multiple lines. Matching is case-insensitive and whole-phrase; saying the trigger alone (with whisper's own trailing period) still expands cleanly.",
+  "_phrases_comment": "Say a trigger phrase, get this saved block of text pasted verbatim instead. A sibling of \"replacements\", not merged into it: this text is never sent through the optional LLM polish pass and reaches the clipboard exactly as written, so it is the right place for standard boilerplate you want word-for-word, never for text you want cleaned up. The one exception is prompt mode (--optimize-for), where the expansion happens first and the expanded text is therefore part of the dictation sent to the Claude CLI, because in that mode the whole dictation is by definition. Values may span multiple lines. Matching is case-insensitive and whole-phrase; saying the trigger alone (with whisper's own trailing period) still expands cleanly.",
   "phrases": {
     "standard engagement caveat": "This engagement is provided on our standard consulting terms and does not constitute financial advice.",
     "insert signature": "Best regards,\nYour Name Here"

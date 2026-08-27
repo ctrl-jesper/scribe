@@ -2,9 +2,22 @@
 
 All notable changes to Scribe are documented in this file.
 
-## [Unreleased]
+## [0.5.0] - 2026-08-27
 
 ### Added
+
+- **Second thoughts.** Spoken self-corrections resolve themselves: "book the flight, scratch
+  that, book the train" keeps only the train, and "coffee at 2, actually 3" gives you 3.
+  Deterministic and local, with no AI call. Deliberately narrow, because "actually" is an
+  ordinary word: it fires only on an explicit retraction command, or when a number or time is
+  replaced by another of the same kind within a few words. "I actually think that's right" and
+  "the 2 funds actually performed well" are left untouched. A retraction never reaches past the
+  start of the current sentence and never empties the text.
+- **Phrases.** Say a trigger, get a saved block of text, configured in `dictionary.json`
+  alongside the replacement rules. Values may span several lines. Expansion runs after the AI
+  polish pass, so stored boilerplate reaches the clipboard exactly as written instead of being
+  reworded. In prompt mode the expansion runs first, so the expanded text is part of the
+  dictation sent to the Claude CLI, as the whole dictation is in that mode anyway.
 
 - **Hands-free recording (latch).** Tap Left Shift while holding push-to-talk, and recording
   continues after you release the key; press push-to-talk again to finish. Left Shift is the
