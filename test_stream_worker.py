@@ -460,6 +460,141 @@ check("finalize_text honours spoken_punctuation.enabled=false",
       "hello new paragraph world")
 
 
+# --- 5c. phrases: pipeline.apply_phrases / pipeline.load_phrases ------------------------
+# These belong to pipeline.py, but pipeline.py is owned by another agent working concurrently
+# in a different worktree, so its own tests live here rather than in test_pipeline.py. `p` is
+# the same pipeline.py module test_pipeline.py tests; consider moving this section there.
+PHRASES = {
+    "standard engagement caveat": ("This engagement is provided on our standard consulting "
+                                   "terms and does not constitute financial advice."),
+    "insert signature": "Best regards,\nYour Name Here",
+}
+
+# Happy path: mid-sentence trigger, everything around it survives untouched.
+check("a mid-sentence trigger expands and the rest of the sentence survives",
+      p.apply_phrases("he said standard engagement caveat during the call", PHRASES),
+      "he said This engagement is provided on our standard consulting terms and does not "
+      "constitute financial advice. during the call")
+
+# Happy path (the pinned edge case): whisper appends sentence punctuation to a standalone
+# dictation ("insert signature" arrives as "Insert signature."). DECISION: the trailing mark
+# is consumed along with the trigger, so the expansion leaves no stray mark behind. A trigger
+# spoken mid-sentence has no mark directly touching it, so that case (above) is unaffected.
+check("a standalone trigger consumes whisper's own trailing period",
+      p.apply_phrases("Insert signature.", PHRASES),
+      "Best regards,\nYour Name Here")
+check("the consumed mark may be any single sentence-ending punctuation, not only a period",
+      p.apply_phrases("Insert signature!", PHRASES),
+      "Best regards,\nYour Name Here")
+check("a mark separated from the trigger by a space is NOT consumed (it is not whisper's own)",
+      p.apply_phrases("insert signature .", PHRASES),
+      "Best regards,\nYour Name Here .")
+
+# Happy path: case variation.
+check("matching is case-insensitive",
+      p.apply_phrases("INSERT SIGNATURE now", PHRASES),
+      "Best regards,\nYour Name Here now")
+
+# Happy path: the multi-line value ("insert signature" above) survives with its newline intact;
+# pin it explicitly too.
+check("a multi-line phrase value keeps its newline",
+      "\n" in p.apply_phrases("insert signature", PHRASES), True)
+
+# Happy path: two triggers in one dictation, both expand.
+check("two triggers in one dictation both expand",
+      p.apply_phrases("insert signature and also standard engagement caveat", PHRASES),
+      "Best regards,\nYour Name Here and also This engagement is provided on our "
+      "standard consulting terms and does not constitute financial advice.")
+
+# Word-boundary matching: a short trigger must never fire inside a longer word.
+check("a short trigger does not fire inside a longer word",
+      p.apply_phrases("please review the design carefully", {"sig": "SIGVAL"}),
+      "please review the design carefully")
+
+# Longest trigger first: a trigger that is a prefix of another must not shadow the specific one.
+check("the longest matching trigger wins over a trigger that is its prefix",
+      p.apply_phrases("insert signature please", {"insert": "SHORT", "insert signature": "LONG"}),
+      "LONG please")
+
+# The replacement is produced by a function, never a template string: the same trap
+# apply_dictionary documents. A stored value of "\\1" as a re.sub template raises "invalid
+# group reference"; passed as a function, as here, it is inserted literally.
+check("a phrase value containing a backslash-group reference is inserted literally",
+      p.apply_phrases("please use insert signature here", {"insert signature": "\\1 not a group"}),
+      "please use \\1 not a group here")
+
+# No-op paths: nothing configured, or nothing to expand.
+check("apply_phrases is a no-op with no phrases configured",
+      p.apply_phrases("insert signature", {}), "insert signature")
+check("apply_phrases is a no-op on empty text", p.apply_phrases("", PHRASES), "")
+
+
+def dict_home(dictionary, prefix="scribe-test-phrases-"):
+    """A throwaway SCRIBE_HOME holding only a dictionary.json with the given content.
+
+    `dictionary` is written verbatim: a string is written as-is (so a malformed-JSON case is
+    possible), anything else is JSON-encoded. Mirrors test_pipeline.py's home_with(), kept
+    local here so this file stays self-contained.
+    """
+    home = tempfile.mkdtemp(prefix=prefix)
+    with open(os.path.join(home, "dictionary.json"), "w") as fh:
+        fh.write(dictionary if isinstance(dictionary, str) else json.dumps(dictionary))
+    return home
+
+
+def load_phrases_in(home):
+    """Run load_phrases() with SCRIBE_HOME pointed at `home`, then restore this test's own."""
+    saved = os.environ["SCRIBE_HOME"]
+    os.environ["SCRIBE_HOME"] = home
+    try:
+        p._resolve_paths()          # load_phrases reads the module-level DICT_PATH
+        return p.load_phrases()
+    finally:
+        os.environ["SCRIBE_HOME"] = saved
+        p._resolve_paths()
+
+
+def error_text(fn, *args, **kwargs):
+    """The message of whatever the call raised, or "" if it did not raise."""
+    try:
+        fn(*args, **kwargs)
+    except Exception as exc:
+        return str(exc)
+    return ""
+
+
+# Failure path: a no-op dictionary.json (or no file at all) leaves phrases exactly as it does
+# today: empty, and no crash.
+check("no dictionary.json at all yields no phrases",
+      load_phrases_in(tempfile.mkdtemp(prefix="scribe-test-nofile-")), {})
+check("a dictionary.json with no \"phrases\" key yields no phrases, same as today",
+      load_phrases_in(dict_home({"replacements": {"Akme": "Acme"}})), {})
+check("phrases load correctly alongside a replacements key in the same file",
+      load_phrases_in(dict_home({"replacements": {"Akme": "Acme"},
+                                 "phrases": {"sig": "Signature Block"}})),
+      {"sig": "Signature Block"})
+
+# Failure path: a non-string phrase value names the file and the offending trigger, matching
+# how load_replacements phrases its errors.
+_bad_phrase_home = dict_home({"phrases": {"insert signature": 12345}})
+check_raises("a non-string phrase value is rejected", RuntimeError,
+             load_phrases_in, _bad_phrase_home)
+_bad_phrase_msg = error_text(load_phrases_in, _bad_phrase_home)
+check("the error names the dictionary file",
+      os.path.join(_bad_phrase_home, "dictionary.json") in _bad_phrase_msg, True)
+check("the error names the offending trigger", "insert signature" in _bad_phrase_msg, True)
+
+# Failure path: "phrases" itself must be a JSON object.
+check_raises("phrases as a list is rejected", RuntimeError,
+             load_phrases_in, dict_home({"phrases": ["oops"]}))
+check_raises("phrases as a string is rejected", RuntimeError,
+             load_phrases_in, dict_home({"phrases": "oops"}))
+check_raises("malformed dictionary JSON is a RuntimeError", RuntimeError,
+             load_phrases_in, dict_home("{oops"))
+check_raises("dictionary root as an array is rejected", RuntimeError,
+             load_phrases_in, dict_home("[]"))
+
+
 # emit() persists for the polish/recall hotkeys and reports whether the clipboard is fresh.
 # sw imports its own copy of pipeline (via stream_worker.py's top-level `import pipeline`),
 # separate from `p` loaded above, but both resolved SCRIBE_HOME identically at import time
@@ -901,6 +1036,107 @@ _bad_target_err = sys.stderr.getvalue()
 sys.stderr = _stderr
 check("the unknown-target error lists the accepted targets",
       all(t in _bad_target_err for t in p.OPTIMIZE_TARGETS), True)
+
+
+# --- 6e. phrases through the REAL streaming finish path (_finish), not just apply_phrases
+# directly. This is what run_live/run_file actually call, so it is the closest this suite gets
+# to proving the maintainer's own recording path (streaming) expands phrases, and exactly
+# where relative to the optimizer/polish above.
+#
+# NOTE: ordering here was reversed after an earlier version of this section pinned the OPPOSITE
+# behaviour (phrases expanding AFTER the optimizer). That version made the two recording paths
+# disagree with each other, which HANDOVER.md calls the worst failure mode in this codebase:
+# pipeline.py's batch path has always expanded phrases inside run(), before any --optimize-for
+# rewrite (which only happens later, in __main__). The tests below now pin the corrected,
+# shared order instead.
+_saved_load_phrases = sw.pipeline.load_phrases
+_saved_load_replacements = sw.pipeline.load_replacements
+
+sw.pipeline.load_phrases = lambda: {
+    "standard engagement caveat": "This engagement is subject to our standard terms."}
+_ph_code, _ph_out, _ = finish_capturing(["please review the", "standard engagement caveat"])
+check("the streaming finish path expands a phrase trigger, chunk seam included",
+      (_ph_code, _ph_out),
+      (0, "please review the This engagement is subject to our standard terms.\n"))
+
+# Independence: a replacements entry must not rewrite text a phrase expansion just inserted.
+# "Akme" is a configured mishearing fix (-> "Acme"); dictionary replacements run once, inside
+# finalize_text, BEFORE the phrase is even looked up, and are never re-applied afterward. If
+# phrase content came out garbled by a later replacements pass, this would fail.
+sw.pipeline.load_replacements = lambda: {"Akme": "Acme"}
+sw.pipeline.load_phrases = lambda: {
+    "insert boilerplate": "Please contact Akme Corp for details."}
+_indep_code, _indep_out, _ = finish_capturing(["insert boilerplate"])
+check("phrase content is not touched by a dictionary replacement applied earlier in the chain",
+      (_indep_code, _indep_out), (0, "Please contact Akme Corp for details.\n"))
+
+# Ordering, prompt mode: the phrase expands BEFORE the optimizer's rewrite, matching batch.
+# Proven by handing the optimizer stub the text and asserting it saw the EXPANDED phrase, not
+# the bare trigger: a rewrite is free to reword, move, or drop a trigger word, so the optimizer
+# must already have the real content to build a coherent prompt around.
+sw.pipeline.load_replacements = lambda: {}
+sw.pipeline.load_phrases = lambda: {"insert boilerplate": "EXPANDED BOILERPLATE TEXT"}
+_order_calls = []
+sw.pipeline.optimize_prompt = lambda text, cfg, target, status=None: (
+    _order_calls.append(text), "REWRITTEN")[1]
+_order_code, _order_out, _ = finish_capturing(["insert boilerplate"], optimize_for="opus")
+check("the optimizer sees the EXPANDED phrase text, not the bare trigger",
+      _order_calls, ["EXPANDED BOILERPLATE TEXT"])
+check("the optimizer's rewrite is still what gets emitted",
+      _order_out, "REWRITTEN\n")
+sw.pipeline.optimize_prompt = _saved_optimize
+
+# Ordering, polish: unchanged and pinned explicitly here so it cannot regress alongside the
+# optimizer fix above. Phrases still expand AFTER polish: the polish CLI must never see, and
+# so can never reshape, a phrase's own saved text.
+_saved_polish_with_status = sw.pipeline.polish_with_status
+_polish_order_calls = []
+sw.pipeline.polish_with_status = lambda text, cfg, status=None: (
+    _polish_order_calls.append(text), (text.upper(), True))[1]
+_polish_order_code, _polish_order_out, _ = finish_capturing(
+    ["insert boilerplate"], polish=True, cfg=POLISH_CFG)
+check("the polish pass receives the bare trigger, never the expanded phrase text",
+      _polish_order_calls, ["insert boilerplate"])
+# apply_phrases is case-insensitive, so the trigger is still found (as "INSERT BOILERPLATE")
+# inside the fake polish's uppercased output and expands there, AFTER polish ran.
+check("phrases still expand after polish", _polish_order_out, "EXPANDED BOILERPLATE TEXT\n")
+sw.pipeline.polish_with_status = _saved_polish_with_status
+
+sw.pipeline.load_phrases = _saved_load_phrases
+sw.pipeline.load_replacements = _saved_load_replacements
+
+
+# --- 6f. regression guard: batch and streaming must AGREE on the prompt-mode order -----------
+# The bug being guarded against: streaming once expanded phrases AFTER the optimizer while
+# batch (pipeline.run()) has always expanded them before, since --optimize-for's rewrite in
+# __main__ only happens after run() returns. Prove directly that both hand the optimizer the
+# exact same, already-expanded text for the exact same dictation, so a future edit that makes
+# them disagree again fails loudly here instead of only looking wrong to the maintainer.
+_saved_p_transcribe = p.transcribe
+_saved_p_load_phrases = p.load_phrases
+_saved_p_load_replacements = p.load_replacements
+p.transcribe = lambda wav_path, url, language, prompt: "insert boilerplate"
+p.load_phrases = lambda: {"insert boilerplate": "EXPANDED BOILERPLATE TEXT"}
+p.load_replacements = lambda: {}
+# max_age=None: this reuses the synthetic hdr.wav fixture, which is not a fresh recording.
+_batch_result = p.run(_HDR_WAV, "dict", CFG, max_age=None)
+p.transcribe = _saved_p_transcribe
+p.load_phrases = _saved_p_load_phrases
+p.load_replacements = _saved_p_load_replacements
+check("batch's run() has already expanded the phrase by the time __main__ calls the optimizer",
+      _batch_result, "EXPANDED BOILERPLATE TEXT")
+
+sw.pipeline.load_phrases = lambda: {"insert boilerplate": "EXPANDED BOILERPLATE TEXT"}
+sw.pipeline.load_replacements = lambda: {}
+_stream_optimizer_saw = []
+sw.pipeline.optimize_prompt = lambda text, cfg, target, status=None: (
+    _stream_optimizer_saw.append(text), "REWRITTEN")[1]
+finish_capturing(["insert boilerplate"], optimize_for="opus")
+sw.pipeline.optimize_prompt = _saved_optimize
+sw.pipeline.load_phrases = _saved_load_phrases
+sw.pipeline.load_replacements = _saved_load_replacements
+check("streaming's _finish hands the optimizer the exact same text batch's run() would have",
+      _stream_optimizer_saw, [_batch_result])
 
 
 # --- 7. integration: file mode must match the batch path exactly -------------------------

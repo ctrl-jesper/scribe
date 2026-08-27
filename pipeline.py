@@ -1143,6 +1143,136 @@ def clean_transcript(text, replacements, cfg=None):
 
 
 # --------------------------------------------------------------------------------------
+# Phrases: say a trigger phrase, get a saved block of text
+# --------------------------------------------------------------------------------------
+# Stored as a "phrases" object in dictionary.json, a sibling of "replacements", never merged
+# into it: replacements fix mishearings and may be polished afterwards, phrases must come out
+# verbatim. That is also why apply_phrases() is NOT part of clean_transcript().
+#
+# Ordering relative to the two optional LLM passes is NOT the same for both, and that
+# difference is deliberate:
+#   - Polish (--mode full / --polish): phrases expand AFTER polish, always. Stored boilerplate
+#     (client caveats, bank details) is exactly the material a user opted into cleanup for
+#     their own dictated words, never for their saved text, and expanding first would send it
+#     through the Claude CLI and let the model reshape it. This is the byte-for-byte guarantee:
+#     the saved text reaches the clipboard exactly as written, with no model in between.
+#   - Prompt mode (--optimize-for): phrases expand BEFORE the rewrite. Two reasons: (1)
+#     reliability - the trigger is guaranteed present in the raw transcript, but the rewrite
+#     may reword, move, or drop it, so expanding afterwards can silently fail to fire; (2)
+#     coherence - the optimizer should build its prompt around what the user actually meant,
+#     not splice a full paragraph into the slot it chose for a handful of words it never
+#     understood. There is no byte-for-byte guarantee to protect here in the first place:
+#     prompt mode's entire point is rewriting the dictation through an LLM, so the phrase's own
+#     text DOES reach the Claude CLI as part of that, the same as every other word the user
+#     said. Do not read this section as "phrases never reach an LLM" - that is true only of
+#     the polish pass.
+#
+# Callers: pipeline.run() applies this once, right after its polish step and before returning.
+# Batch mode never combines polish with --optimize-for (argparse refuses --mode full with it),
+# and the CLI's --optimize-for rewrite happens later, in __main__, after run() has already
+# returned - so this single call site already gives the whole batch path the right order:
+# "polish, then phrases, then optimizer". stream_worker._finish() applies it from two call
+# sites, one on each side of its optimizer/polish branch, to reproduce that same order exactly
+# (see the comments at each call site there for why two sites were needed).
+
+def load_phrases():
+    """Phrase triggers from dictionary.json, or none at all if the user has no phrases yet.
+
+    A sibling of load_replacements(), reading the same file but a different top-level key, for
+    the reason explained above. Kept as its own read of DICT_PATH rather than folded into
+    load_replacements() so the two loaders, and their error messages, can evolve independently.
+    """
+    if not os.path.exists(DICT_PATH):
+        return {}
+    try:
+        data = json.load(open(DICT_PATH))
+    except ValueError as exc:
+        raise RuntimeError("invalid JSON in %s: %s" % (DICT_PATH, exc))
+    if not isinstance(data, dict):
+        raise RuntimeError("invalid dictionary in %s: expected a JSON object, got %s"
+                           % (DICT_PATH, type(data).__name__))
+    phrases = data.get("phrases", {})
+    if not isinstance(phrases, dict):
+        raise RuntimeError('invalid "phrases" in %s: expected a JSON object of '
+                           '"trigger phrase": "replacement text" pairs, got %s'
+                           % (DICT_PATH, type(phrases).__name__))
+    for trigger, value in phrases.items():
+        if not isinstance(value, str):
+            raise RuntimeError('invalid phrase for "%s" in %s: expected a string, got %s'
+                               % (trigger, DICT_PATH, type(value).__name__))
+    return phrases
+
+
+# One mark, immediately adjacent with no space, consumed along with the trigger. Whisper
+# appends exactly this kind of mark to a short standalone dictation: saying only "insert
+# signature" arrives as "Insert signature.", and a naive expansion would leave that period
+# dangling right after the inserted block. A trigger spoken mid-sentence ("please see insert
+# signature for details") has no punctuation directly touching it, so this never fires there.
+_PHRASE_TRAILING_MARK = r"[.,!?;:]?"
+
+
+def _phrase_trigger_regex_source(trigger):
+    """Word-boundary regex source for a (possibly multi-word) trigger phrase.
+
+    Words are joined with \\s+ rather than a literal space so an accidental double space in
+    the dictation still matches; the same trick apply_spoken_punctuation's _phrase_regex uses.
+    """
+    return r"\s+".join(re.escape(word) for word in trigger.split())
+
+
+def _compile_phrases(phrases):
+    """One combined regex over every trigger, plus which value each capture group maps to.
+
+    A single combined regex, matched left to right in one pass, so a replacement is never
+    re-scanned by another trigger's pattern and two triggers in the same dictation both expand
+    correctly (the same approach _compile_spoken_punctuation uses, for the same reason).
+    Longest trigger first, so a trigger that is a prefix of another cannot shadow the more
+    specific one: without this, a dictated "insert signature" with both "insert" and "insert
+    signature" configured would match the shorter trigger and leave "signature" behind as a
+    literal, unexpanded word.
+
+    Returns (compiled_regex, value_by_group), or None if `phrases` is empty.
+    """
+    if not phrases:
+        return None
+    ordered = sorted(phrases.items(), key=lambda item: len(item[0]), reverse=True)
+    alternatives = []
+    value_by_group = {}
+    for i, (trigger, value) in enumerate(ordered):
+        group = "ph%d" % i
+        alternatives.append(r"(?P<%s>\b%s\b%s)"
+                            % (group, _phrase_trigger_regex_source(trigger), _PHRASE_TRAILING_MARK))
+        value_by_group[group] = value
+    return re.compile("|".join(alternatives), re.IGNORECASE), value_by_group
+
+
+def apply_phrases(text, phrases):
+    """Expand each configured trigger phrase into its saved block of text.
+
+    Case-insensitive, whole-phrase, word-boundary matched, so a trigger "sig" never fires
+    inside "design". The replacement is produced by a function, never a template string: as in
+    apply_dictionary, a stored value containing "\\1" would otherwise raise "invalid group
+    reference" and break every dictation until the entry was found, and a "\\g<x>" would be
+    expanded rather than typed. Call this after polish and, in prompt mode, before the
+    optimizer rewrite; see the section note above for the exact order on each path and why.
+    """
+    if not text or not phrases:
+        return text
+    compiled = _compile_phrases(phrases)
+    if compiled is None:
+        return text
+    regex, value_by_group = compiled
+
+    def _replace(m):
+        for group, value in value_by_group.items():
+            if m.group(group) is not None:
+                return value
+        return m.group(0)   # unreachable: a match always belongs to exactly one alternative
+
+    return regex.sub(_replace, text)
+
+
+# --------------------------------------------------------------------------------------
 # Claude CLI login state
 # --------------------------------------------------------------------------------------
 
@@ -1498,6 +1628,11 @@ def run(wav_path, mode, cfg, timings=False, max_age=DEFAULT_MAX_AGE_S,
             text, polished = polish_with_status(text, cfg, status); t["llm"] = time.time() - t2
             if not polished and status is not None:
                 status["polish_fallback"] = True
+    # Phrase expansion runs here: after the optional polish above (byte-for-byte guarantee;
+    # polish must never reshape stored boilerplate) and before any --optimize-for rewrite,
+    # which happens later, in __main__, once this function has already returned. See the
+    # "Phrases" section note above for why the two LLM passes are treated differently.
+    text = apply_phrases(text, load_phrases())
     if timings:
         sys.stderr.write("timings: " + ", ".join(f"{k}={v:.2f}s" for k, v in t.items()) + "\n")
     return text
