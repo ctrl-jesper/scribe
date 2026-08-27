@@ -391,6 +391,182 @@ check("clean_transcript with tier 2 off leaves an ordinary 'period' alone",
       p.clean_transcript("the period of the loan", {}, TIER1_CFG), "the period of the loan")
 
 
+# ============================================================================================
+# Second thoughts: resolve spoken self-corrections
+#
+# The central danger this feature exists to avoid: "actually" is an extremely common English
+# discourse marker. Every false-positive case below is required by the feature spec, not
+# optional coverage - a naive rule here would destroy ordinary speech.
+# ============================================================================================
+
+# --- second thoughts: config defaults ------------------------------------------------------
+check("second thoughts is on by default", p.DEFAULTS["second_thoughts"]["enabled"], True)
+check("retraction commands are on by default",
+      p.DEFAULTS["second_thoughts"]["retraction_commands"], True)
+check("value corrections are on by default",
+      p.DEFAULTS["second_thoughts"]["value_corrections"], True)
+check("the value-correction word-distance limit is small and documented",
+      p.SECOND_THOUGHTS_MAX_GAP_WORDS, 3)
+
+# --- case A, retraction commands: happy paths -----------------------------------------------
+check("scratch that deletes back to the start of the sentence, trigger included",
+      p.resolve_second_thoughts("book the flight, scratch that, book the train"),
+      "book the train")
+check("strike that works the same way",
+      p.resolve_second_thoughts("call the client strike that call the vendor"),
+      "call the vendor")
+check("forget that works the same way",
+      p.resolve_second_thoughts("forget that never mind"),
+      "never mind")
+check("retraction trigger is matched case-insensitively",
+      p.resolve_second_thoughts("Book it Scratch That do the other thing"),
+      "do the other thing")
+check("retraction deletes only up to the trigger, not the whole clause after it",
+      p.resolve_second_thoughts("I want coffee at two scratch that let's do three"),
+      "let's do three")
+check("a chain of retractions resolves down to the final clause",
+      p.resolve_second_thoughts(
+          "book the flight, strike that, book the train, scratch that, book the bus"),
+      "book the bus")
+
+# --- case A: must never delete across a sentence boundary into the previous sentence ---------
+check("retraction stops at the previous sentence's full stop and does not reach into it",
+      p.resolve_second_thoughts("Hi there. Wait scratch that, let's continue. Next line."),
+      "Hi there. let's continue. Next line.")
+
+# --- case A: must never empty the entire text -------------------------------------------------
+check("a retraction that would empty the whole text leaves it unchanged instead",
+      p.resolve_second_thoughts("scratch that"),
+      "scratch that")
+
+# --- case B, same-type value correction: happy paths, the two examples from the spec ---------
+check("number correction: coffee at 2, actually 3 -> coffee at 3",
+      p.resolve_second_thoughts("coffee at 2, actually 3"),
+      "coffee at 3")
+check("percent correction: let's say 15 percent, I mean 20 percent -> let's say 20 percent",
+      p.resolve_second_thoughts("let's say 15 percent, I mean 20 percent"),
+      "let's say 20 percent")
+
+# --- case B: written-out numbers are supported for the single-word case only -----------------
+# "twenty-three" style compounds are NOT merged into one value (see _NUMBER_SRC's comment);
+# this is the one case the feature spec requires be tested if claimed, so it is tested here.
+check("single-word written-out numbers are supported ('two' / 'three')",
+      p.resolve_second_thoughts("let's do two, actually three"),
+      "let's do three")
+
+# --- case B: clock times are their own kind, and every other trigger word works too ----------
+check("clock-time correction ('3pm' / '4pm'), trigger 'no wait'",
+      p.resolve_second_thoughts("meet at 3pm, no wait 4pm"),
+      "meet at 4pm")
+check("trigger 'sorry'",
+      p.resolve_second_thoughts("call me at 5, sorry 6"),
+      "call me at 6")
+check("trigger 'make that'",
+      p.resolve_second_thoughts("let's meet at two, make that three"),
+      "let's meet at three")
+check("a chain of value corrections resolves down to the final value",
+      p.resolve_second_thoughts("coffee at 2, actually 3, no wait 4"),
+      "coffee at 4")
+
+# --- case B: REQUIRED false-positive battery --------------------------------------------------
+# Ordinary speech containing "actually", "I mean", or "sorry" with no flanking number/time pair
+# must come back byte-identical. This is the feature's whole reason for existing.
+FALSE_POSITIVES = [
+    "I actually think that's right",
+    "we actually agreed",
+    "actually, let me explain",
+    "I mean it when I say this",
+    "sorry for the delay",
+]
+for _fp in FALSE_POSITIVES:
+    check("false positive is untouched: %r" % _fp, p.resolve_second_thoughts(_fp), _fp)
+
+# --- case B: a type mismatch (number vs. time) must do nothing, even with values close by ----
+check("a number 'corrected' by a time does nothing (kinds differ)",
+      p.resolve_second_thoughts("the room is 3, actually make it 3pm"),
+      "the room is 3, actually make it 3pm")
+
+# --- case B: a trigger too far (in words) from any value must do nothing ---------------------
+check("a trigger far from the nearest values on both sides does nothing",
+      p.resolve_second_thoughts(
+          "we had 2 people in the room and it was fine but actually let me tell you a "
+          "story about 3 different topics"),
+      "we had 2 people in the room and it was fine but actually let me tell you a "
+      "story about 3 different topics")
+
+# --- case B: an ordinal's digit is not a NUMBER, so it cannot pair with anything --------------
+check("'2nd' does not read as a NUMBER, so no pairing is even attempted",
+      p.resolve_second_thoughts("on the 2nd, actually let us push it"),
+      "on the 2nd, actually let us push it")
+
+# --- second thoughts: sub-toggles act independently -------------------------------------------
+_ST_OFF = {"second_thoughts": {"enabled": False, "retraction_commands": True,
+                               "value_corrections": True}}
+check("second_thoughts.enabled=false disables both cases",
+      p.resolve_second_thoughts("coffee at 2, actually 3, scratch that", _ST_OFF),
+      "coffee at 2, actually 3, scratch that")
+
+_TWO_SENTENCE = "Coffee at 2, actually 3. Book flight, scratch that, book train."
+_ST_RETRACT_ONLY = {"second_thoughts": {"enabled": True, "retraction_commands": True,
+                                        "value_corrections": False}}
+check("value_corrections=false leaves numbers alone but still retracts",
+      p.resolve_second_thoughts(_TWO_SENTENCE, _ST_RETRACT_ONLY),
+      "Coffee at 2, actually 3. book train.")
+_ST_VALUE_ONLY = {"second_thoughts": {"enabled": True, "retraction_commands": False,
+                                      "value_corrections": True}}
+check("retraction_commands=false leaves 'scratch that' alone but still corrects values",
+      p.resolve_second_thoughts(_TWO_SENTENCE, _ST_VALUE_ONLY),
+      "Coffee at 3. Book flight, scratch that, book train.")
+
+# --- second thoughts: empty and None text are safe, on every entry point ---------------------
+check("resolve_second_thoughts('') is ''", p.resolve_second_thoughts(""), "")
+check("resolve_second_thoughts(None) is None", p.resolve_second_thoughts(None), None)
+check("apply_retractions('') is ''", p.apply_retractions(""), "")
+check("apply_retractions(None) is None", p.apply_retractions(None), None)
+check("apply_value_corrections('') is ''", p.apply_value_corrections(""), "")
+check("apply_value_corrections(None) is None", p.apply_value_corrections(None), None)
+
+# --- second thoughts: config validation, invalid types raise with file and key context -------
+_st_not_object = home_with({"second_thoughts": "nope"})
+check_raises("second_thoughts as a non-object is rejected", RuntimeError,
+             load_config_in, _st_not_object)
+_st_msg = error_text(load_config_in, _st_not_object)
+check("second_thoughts error names the config file",
+      os.path.join(_st_not_object, "config.json") in _st_msg, True)
+check("second_thoughts error names the key", "second_thoughts" in _st_msg, True)
+
+check_raises("second_thoughts.enabled as a string is rejected", RuntimeError,
+             load_config_in, home_with({"second_thoughts": {"enabled": "yes"}}))
+check_raises("second_thoughts.retraction_commands as a string is rejected", RuntimeError,
+             load_config_in, home_with({"second_thoughts": {"retraction_commands": "yes"}}))
+check_raises("second_thoughts.value_corrections as a string is rejected", RuntimeError,
+             load_config_in, home_with({"second_thoughts": {"value_corrections": "yes"}}))
+
+# --- second thoughts: a partial override still gets the missing defaults back ----------------
+# Same fix as spoken_punctuation's: a plain dict.update would replace "second_thoughts"
+# wholesale and silently drop "enabled"/"retraction_commands" when a user sets only one key.
+_partial_st = load_config_in(home_with({"second_thoughts": {"value_corrections": False}}))
+check("a partial second_thoughts override keeps enabled=true from the defaults",
+      _partial_st["second_thoughts"]["enabled"], True)
+check("...and keeps retraction_commands=true from the defaults",
+      _partial_st["second_thoughts"]["retraction_commands"], True)
+check("...while applying the one key the user actually set",
+      _partial_st["second_thoughts"]["value_corrections"], False)
+
+# --- second thoughts: clean_transcript is the one shared chain, so the streaming path gets it
+# automatically. stream_worker.py's finalize_text() calls this exact function (see its own
+# docstring), so proving clean_transcript resolves a correction is proving the streaming path
+# does too; this worktree does not own stream_worker.py or its test file.
+check("clean_transcript resolves a value correction after collapsing and before spoken "
+      "punctuation, which is what finalize_text() in stream_worker.py calls",
+      p.clean_transcript("coffee at 2, actually 3 new paragraph done", {}),
+      "coffee at 3\n\ndone")
+check("clean_transcript resolves a retraction the same way",
+      p.clean_transcript("book the flight, scratch that, book the train new paragraph done",
+                         {}),
+      "book the train\n\ndone")
+
+
 # --- config: the two new keys the installer writes ---------------------------------------
 check("ffmpeg_bin defaults to an absolute path resolved at load time",
       os.path.isabs(p.DEFAULTS["ffmpeg_bin"]), True)
