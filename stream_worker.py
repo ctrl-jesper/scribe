@@ -26,25 +26,35 @@ Two measured facts shape every decision here:
     happens ONLY at a detected silence; if there is no silence, nothing is handed off and
     the run simply degrades to plain batch behaviour.
 
-Prompt mode (--optimize-for): after the chunks are merged and cleaned, the text is rewritten
-into a prompt aimed at one target model (fable, opus, sonnet) by pipeline.optimize_prompt,
-and that rewrite is what is emitted and copied. The worker prints the OPTIMIZING phase marker
-on its own stdout, the same channel MIC_READY and the LEVEL meters already use, immediately
-before the rewriting CLI starts.
+Phrases: each configured trigger phrase (dictionary.json's "phrases" object) is expanded into
+its saved block of text by pipeline.apply_phrases. WHERE this happens relative to the two LLM
+passes below is not the same for both, and is not simply "always last":
+  - Relative to auto-polish, phrases expand AFTER it. Polish must never reshape stored
+    boilerplate, so phrase content is never sent through the polish CLI.
+  - Relative to prompt mode, phrases expand BEFORE the rewrite, so the trigger is guaranteed to
+    still be present (a rewrite can reword, move, or drop it) and the optimizer builds its
+    prompt around the real expanded content rather than a few words standing in for it. Prompt
+    mode sends the whole dictation to the Claude CLI by definition, so the phrase's own text
+    DOES reach it here, same as any other word the user said; there is no verbatim guarantee to
+    protect in this one mode. See pipeline.py's "Phrases" section for the full reasoning.
+This exactly matches pipeline.py's batch path, where phrases expand once, inside run(), after
+its polish step and before any --optimize-for rewrite (which always runs later, in __main__).
+
+Prompt mode (--optimize-for): after the chunks are merged, cleaned, and phrase-expanded, the
+text is rewritten into a prompt aimed at one target model (fable, opus, sonnet) by
+pipeline.optimize_prompt, and that rewrite is what is emitted and copied. The worker prints the
+OPTIMIZING phase marker on its own stdout, the same channel MIC_READY and the LEVEL meters
+already use, immediately before the rewriting CLI starts.
 
 Auto-polish (--polish): after the chunks are merged and cleaned, the text is run through the
-same `claude -p` cleanup the --polish-last hotkey uses (pipeline.polish_with_status), and the
-polished text is what is emitted and copied. The worker prints the POLISHING phase marker on
-its own stdout immediately before that CLI starts, exactly as it does for OPTIMIZING.
+same `claude -p` cleanup the --polish-last hotkey uses (pipeline.polish_with_status), then
+phrase-expanded, and the result is what is emitted and copied. The worker prints the POLISHING
+phase marker on its own stdout immediately before that CLI starts, exactly as it does for
+OPTIMIZING.
 
 Precedence, when both --optimize-for and --polish are given: the OPTIMIZER WINS and the
 polish is skipped entirely. The rewrite already cleans up the same things the polish would,
 so running both would cost ~22s of LLM time for one dictation and throw half of it away.
-
-Phrases: after everything above (optimizer or polish, if either ran), each configured trigger
-phrase (dictionary.json's "phrases" object) is expanded into its saved block of text by
-pipeline.apply_phrases, immediately before the result is emitted and copied. Always last, and
-never sent through either LLM pass: see pipeline.py's "Phrases" section for why.
 
 Exit codes: 0 success (text on stdout and, with --copy, on the clipboard), 3 nothing was
 captured (dictate.lua treats this as an aborted dictation: no paste, no error), 1 failure,
@@ -861,6 +871,17 @@ def _finish(session, transcriber, cfg, copy, timings, t_release, extra, optimize
 
     code = 0
     if optimize_for:
+        # Phrases expand BEFORE the rewrite here, matching pipeline.py's batch path exactly:
+        # there, --optimize-for always runs in __main__ after run() has already expanded
+        # phrases. Reliability: the trigger is guaranteed present in this raw, merged text, but
+        # the rewrite may reword, move, or drop it, so expanding afterwards can silently fail
+        # to fire. Coherence: the optimizer should build its prompt around what the user
+        # actually meant, not splice a full paragraph into the slot it chose for a few words it
+        # never understood. This is also the one path where the phrase's own text DOES reach an
+        # LLM: prompt mode sends the whole dictation to the Claude CLI by definition, so there
+        # is no verbatim guarantee to protect here in the first place (see pipeline.py's
+        # "Phrases" section).
+        text = pipeline.apply_phrases(text, pipeline.load_phrases())
         if polish:
             # Precedence: the optimizer wins and the polish is skipped entirely. The rewrite
             # cleans the same things the polish would, so running both would spend ~22s of LLM
@@ -872,17 +893,22 @@ def _finish(session, transcriber, cfg, copy, timings, t_release, extra, optimize
         if optimized:
             text = optimized
         else:
-            # Emit the raw cleaned transcription anyway: a failed rewrite must never cost the
-            # user their words. The exit code is the only signal that it was not rewritten,
-            # and a CLI that said it is logged out gets the code that names the fix.
+            # Emit the raw cleaned (and already phrase-expanded) transcription anyway: a failed
+            # rewrite must never cost the user their words. The exit code is the only signal
+            # that it was not rewritten, and a CLI that said it is logged out gets the code
+            # that names the fix.
             code = EXIT_AUTH_NEEDED if status.get("auth_needed") else EXIT_OPTIMIZER_FALLBACK
     elif polish:
         text, code = _apply_polish(text, cfg)
-
-    # Phrase expansion runs last, after both the optimizer and the polish above, and right
-    # before emit(): see pipeline.py's "Phrases" section note for why (privacy, and a
-    # byte-for-byte guarantee an LLM pass would otherwise break).
-    text = pipeline.apply_phrases(text, pipeline.load_phrases())
+        # Phrases expand AFTER polish here, unlike the optimizer branch above: this is the
+        # path that must keep the byte-for-byte guarantee, so stored boilerplate is never
+        # rewritten by the cleanup pass. See pipeline.py's "Phrases" section for why the two
+        # LLM passes are treated differently, and why this needs its own call site rather than
+        # one shared spot after this whole if/elif.
+        text = pipeline.apply_phrases(text, pipeline.load_phrases())
+    else:
+        # Neither pass ran; still expand phrases before emitting.
+        text = pipeline.apply_phrases(text, pipeline.load_phrases())
 
     copied = emit(text, copy=copy)
     if timings:

@@ -1040,8 +1040,15 @@ check("the unknown-target error lists the accepted targets",
 
 # --- 6e. phrases through the REAL streaming finish path (_finish), not just apply_phrases
 # directly. This is what run_live/run_file actually call, so it is the closest this suite gets
-# to proving the maintainer's own recording path (streaming) expands phrases, and that it does
-# so AFTER the optimizer/polish above, immediately before emit.
+# to proving the maintainer's own recording path (streaming) expands phrases, and exactly
+# where relative to the optimizer/polish above.
+#
+# NOTE: ordering here was reversed after an earlier version of this section pinned the OPPOSITE
+# behaviour (phrases expanding AFTER the optimizer). That version made the two recording paths
+# disagree with each other, which HANDOVER.md calls the worst failure mode in this codebase:
+# pipeline.py's batch path has always expanded phrases inside run(), before any --optimize-for
+# rewrite (which only happens later, in __main__). The tests below now pin the corrected,
+# shared order instead.
 _saved_load_phrases = sw.pipeline.load_phrases
 _saved_load_replacements = sw.pipeline.load_replacements
 
@@ -1063,23 +1070,73 @@ _indep_code, _indep_out, _ = finish_capturing(["insert boilerplate"])
 check("phrase content is not touched by a dictionary replacement applied earlier in the chain",
       (_indep_code, _indep_out), (0, "Please contact Akme Corp for details.\n"))
 
-# Ordering: the phrase expands AFTER the optimizer's rewrite, not before. Proven by handing the
-# optimizer stub the pre-expansion text and asserting the trigger, not the expanded block,
-# is what it actually saw.
+# Ordering, prompt mode: the phrase expands BEFORE the optimizer's rewrite, matching batch.
+# Proven by handing the optimizer stub the text and asserting it saw the EXPANDED phrase, not
+# the bare trigger: a rewrite is free to reword, move, or drop a trigger word, so the optimizer
+# must already have the real content to build a coherent prompt around.
 sw.pipeline.load_replacements = lambda: {}
-sw.pipeline.load_phrases = lambda: {"insert boilerplate": "SHOULD NOT REACH THE OPTIMIZER"}
+sw.pipeline.load_phrases = lambda: {"insert boilerplate": "EXPANDED BOILERPLATE TEXT"}
 _order_calls = []
 sw.pipeline.optimize_prompt = lambda text, cfg, target, status=None: (
     _order_calls.append(text), "REWRITTEN")[1]
 _order_code, _order_out, _ = finish_capturing(["insert boilerplate"], optimize_for="opus")
-check("the optimizer sees the trigger, never the phrase's own saved text",
-      _order_calls, ["insert boilerplate"])
-check("the optimizer's rewrite is what gets emitted; the phrase never had a chance to fire",
+check("the optimizer sees the EXPANDED phrase text, not the bare trigger",
+      _order_calls, ["EXPANDED BOILERPLATE TEXT"])
+check("the optimizer's rewrite is still what gets emitted",
       _order_out, "REWRITTEN\n")
 sw.pipeline.optimize_prompt = _saved_optimize
 
+# Ordering, polish: unchanged and pinned explicitly here so it cannot regress alongside the
+# optimizer fix above. Phrases still expand AFTER polish: the polish CLI must never see, and
+# so can never reshape, a phrase's own saved text.
+_saved_polish_with_status = sw.pipeline.polish_with_status
+_polish_order_calls = []
+sw.pipeline.polish_with_status = lambda text, cfg, status=None: (
+    _polish_order_calls.append(text), (text.upper(), True))[1]
+_polish_order_code, _polish_order_out, _ = finish_capturing(
+    ["insert boilerplate"], polish=True, cfg=POLISH_CFG)
+check("the polish pass receives the bare trigger, never the expanded phrase text",
+      _polish_order_calls, ["insert boilerplate"])
+# apply_phrases is case-insensitive, so the trigger is still found (as "INSERT BOILERPLATE")
+# inside the fake polish's uppercased output and expands there, AFTER polish ran.
+check("phrases still expand after polish", _polish_order_out, "EXPANDED BOILERPLATE TEXT\n")
+sw.pipeline.polish_with_status = _saved_polish_with_status
+
 sw.pipeline.load_phrases = _saved_load_phrases
 sw.pipeline.load_replacements = _saved_load_replacements
+
+
+# --- 6f. regression guard: batch and streaming must AGREE on the prompt-mode order -----------
+# The bug being guarded against: streaming once expanded phrases AFTER the optimizer while
+# batch (pipeline.run()) has always expanded them before, since --optimize-for's rewrite in
+# __main__ only happens after run() returns. Prove directly that both hand the optimizer the
+# exact same, already-expanded text for the exact same dictation, so a future edit that makes
+# them disagree again fails loudly here instead of only looking wrong to the maintainer.
+_saved_p_transcribe = p.transcribe
+_saved_p_load_phrases = p.load_phrases
+_saved_p_load_replacements = p.load_replacements
+p.transcribe = lambda wav_path, url, language, prompt: "insert boilerplate"
+p.load_phrases = lambda: {"insert boilerplate": "EXPANDED BOILERPLATE TEXT"}
+p.load_replacements = lambda: {}
+# max_age=None: this reuses the synthetic hdr.wav fixture, which is not a fresh recording.
+_batch_result = p.run(_HDR_WAV, "dict", CFG, max_age=None)
+p.transcribe = _saved_p_transcribe
+p.load_phrases = _saved_p_load_phrases
+p.load_replacements = _saved_p_load_replacements
+check("batch's run() has already expanded the phrase by the time __main__ calls the optimizer",
+      _batch_result, "EXPANDED BOILERPLATE TEXT")
+
+sw.pipeline.load_phrases = lambda: {"insert boilerplate": "EXPANDED BOILERPLATE TEXT"}
+sw.pipeline.load_replacements = lambda: {}
+_stream_optimizer_saw = []
+sw.pipeline.optimize_prompt = lambda text, cfg, target, status=None: (
+    _stream_optimizer_saw.append(text), "REWRITTEN")[1]
+finish_capturing(["insert boilerplate"], optimize_for="opus")
+sw.pipeline.optimize_prompt = _saved_optimize
+sw.pipeline.load_phrases = _saved_load_phrases
+sw.pipeline.load_replacements = _saved_load_replacements
+check("streaming's _finish hands the optimizer the exact same text batch's run() would have",
+      _stream_optimizer_saw, [_batch_result])
 
 
 # --- 7. integration: file mode must match the batch path exactly -------------------------

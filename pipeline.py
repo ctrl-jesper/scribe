@@ -897,18 +897,33 @@ def clean_transcript(text, replacements, cfg=None):
 # --------------------------------------------------------------------------------------
 # Stored as a "phrases" object in dictionary.json, a sibling of "replacements", never merged
 # into it: replacements fix mishearings and may be polished afterwards, phrases must come out
-# verbatim. That is also why apply_phrases() is NOT part of clean_transcript() and is never
-# called from run() or _finish() until every other step, including the optional LLM polish and
-# the prompt-optimizer rewrite, has already happened. Two reasons, both load-bearing:
-#   (a) phrase content is exactly the material most likely to be private and verbatim-critical
-#       (client boilerplate, standard caveats, bank details). Expanding before polish would
-#       send it through the Claude CLI, which the user only opted into for their dictation,
-#       never for their stored boilerplate.
-#   (b) expanding last guarantees the saved text reaches the clipboard byte-for-byte as
-#       written, with no model reshaping it in between.
-# Callers: pipeline.run() applies this after its polish step, and stream_worker._finish()
-# applies it after its polish/optimizer step, immediately before the text is emitted and
-# copied. Both call this one function so the two recording paths cannot drift apart.
+# verbatim. That is also why apply_phrases() is NOT part of clean_transcript().
+#
+# Ordering relative to the two optional LLM passes is NOT the same for both, and that
+# difference is deliberate:
+#   - Polish (--mode full / --polish): phrases expand AFTER polish, always. Stored boilerplate
+#     (client caveats, bank details) is exactly the material a user opted into cleanup for
+#     their own dictated words, never for their saved text, and expanding first would send it
+#     through the Claude CLI and let the model reshape it. This is the byte-for-byte guarantee:
+#     the saved text reaches the clipboard exactly as written, with no model in between.
+#   - Prompt mode (--optimize-for): phrases expand BEFORE the rewrite. Two reasons: (1)
+#     reliability - the trigger is guaranteed present in the raw transcript, but the rewrite
+#     may reword, move, or drop it, so expanding afterwards can silently fail to fire; (2)
+#     coherence - the optimizer should build its prompt around what the user actually meant,
+#     not splice a full paragraph into the slot it chose for a handful of words it never
+#     understood. There is no byte-for-byte guarantee to protect here in the first place:
+#     prompt mode's entire point is rewriting the dictation through an LLM, so the phrase's own
+#     text DOES reach the Claude CLI as part of that, the same as every other word the user
+#     said. Do not read this section as "phrases never reach an LLM" - that is true only of
+#     the polish pass.
+#
+# Callers: pipeline.run() applies this once, right after its polish step and before returning.
+# Batch mode never combines polish with --optimize-for (argparse refuses --mode full with it),
+# and the CLI's --optimize-for rewrite happens later, in __main__, after run() has already
+# returned - so this single call site already gives the whole batch path the right order:
+# "polish, then phrases, then optimizer". stream_worker._finish() applies it from two call
+# sites, one on each side of its optimizer/polish branch, to reproduce that same order exactly
+# (see the comments at each call site there for why two sites were needed).
 
 def load_phrases():
     """Phrase triggers from dictionary.json, or none at all if the user has no phrases yet.
@@ -988,7 +1003,8 @@ def apply_phrases(text, phrases):
     inside "design". The replacement is produced by a function, never a template string: as in
     apply_dictionary, a stored value containing "\\1" would otherwise raise "invalid group
     reference" and break every dictation until the entry was found, and a "\\g<x>" would be
-    expanded rather than typed. Call this LAST; see the section note above for why.
+    expanded rather than typed. Call this after polish and, in prompt mode, before the
+    optimizer rewrite; see the section note above for the exact order on each path and why.
     """
     if not text or not phrases:
         return text
@@ -1362,8 +1378,10 @@ def run(wav_path, mode, cfg, timings=False, max_age=DEFAULT_MAX_AGE_S,
             text, polished = polish_with_status(text, cfg, status); t["llm"] = time.time() - t2
             if not polished and status is not None:
                 status["polish_fallback"] = True
-    # Phrase expansion runs last, after the optional polish above: see the "Phrases" section
-    # note for why (privacy, and a byte-for-byte guarantee polish would otherwise break).
+    # Phrase expansion runs here: after the optional polish above (byte-for-byte guarantee;
+    # polish must never reshape stored boilerplate) and before any --optimize-for rewrite,
+    # which happens later, in __main__, once this function has already returned. See the
+    # "Phrases" section note above for why the two LLM passes are treated differently.
     text = apply_phrases(text, load_phrases())
     if timings:
         sys.stderr.write("timings: " + ", ".join(f"{k}={v:.2f}s" for k, v in t.items()) + "\n")
