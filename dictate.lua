@@ -42,6 +42,10 @@ scribe.micIndex = nil           -- resolved by name below; nil means "do not rec
 scribe.micName = nil            -- the name we are looking for, for error messages
 scribe.workerPid = nil          -- PID of the streaming worker, so we signal only ours
 scribe.optimizing = false       -- the prompt rewrite has started for the dictation in flight
+scribe.latchArmed = false       -- the latch key was tapped while PTT is still held, this hold
+scribe.latched = false          -- PTT was released while armed; recording continues hands-free
+scribe.latchStopping = false    -- a PTT press just stopped a latched recording; the matching
+                                 -- key-up of that same press must not start or stop anything
 
 local HOME        = os.getenv("HOME")
 local SCRIBE_HOME = HOME .. "/.config/scribe"
@@ -96,6 +100,17 @@ local PYTHON, PYTHON_TRIED = pickBinary(cfg.python_bin,
 
 local PTT_KEYCODE    = cfg.hotkey_keycode or 61          -- 61 = right option
 local PTT_FLAG       = configString(cfg.hotkey_flag) or "alt"   -- the modifier that keycode raises
+
+-- Latch: tap this key while PTT is still held to keep recording hands-free after release; press
+-- PTT again to stop. Same shape as PTT_KEYCODE/PTT_FLAG above. Left shift types no character on
+-- its own, which is why it is the default: like PTT itself, the latch gesture never needs to
+-- consume an event. On by default (the maintainer asked for this feature); cfg.latch_enabled =
+-- false switches it off. Read with ~= false, not == true, so the default is "on" rather than
+-- "off" unless the config says otherwise.
+local LATCH_ENABLED  = cfg.latch_enabled ~= false
+local LATCH_KEYCODE  = cfg.latch_keycode or 56           -- 56 = left shift
+local LATCH_FLAG     = configString(cfg.latch_flag) or "shift"
+
 local POLISH_ENABLED = cfg.polish_enabled == true        -- optional LLM pass; hidden when off
 local CUE_SOUND      = hs.sound.getByName("Tink")
 
@@ -871,6 +886,7 @@ local function batchRecorderFinished(exitCode, _, stderr)
         -- Died while we still believe we are recording: the mic never opened. Say so now
         -- rather than letting the release paste a stale result.
         scribe.recording, scribe.cued = false, false
+        scribe.latchArmed, scribe.latched = false, false   -- a stale latch would misread the next PTT press
         if scribe.cueTimer then scribe.cueTimer:stop() end
         if scribe.animTimer then scribe.animTimer:stop() end
         hideHUD(true)
@@ -890,6 +906,7 @@ local function streamWorkerFinished(exitCode, _, stderr)
         -- The worker died while the key is still held. Reset now, or the release
         -- would sit at "transcribing" forever waiting for a process that is gone.
         scribe.recording, scribe.cued = false, false
+        scribe.latchArmed, scribe.latched = false, false   -- a stale latch would misread the next PTT press
         if scribe.cueTimer then scribe.cueTimer:stop() end
         finishTranscription()
         alertProblem("recording stopped unexpectedly (worker exit "
@@ -967,6 +984,10 @@ local function startRecording()
     end
 
     scribe.recording, scribe.cued = true, false
+    -- Every fresh recording starts unlatched and unarmed, even if a previous one somehow left
+    -- these set (e.g. the recorder died mid-latch below); a stale scribe.latched here would
+    -- make the very next PTT press stop instead of start.
+    scribe.latchArmed, scribe.latched, scribe.latchStopping = false, false, false
 
     if scribe.activeStreaming then
         if scribe.workerPid then signalPid(scribe.workerPid) end  -- a worker left by a crashed run
@@ -1060,10 +1081,68 @@ local function stopRecording()
     end
 end
 
--- Push-to-talk: watch the modifier without consuming it, so normal typing still works.
+-- Latch feedback: "armed" is a one-shot cue at the moment of the gesture, the same
+-- hs.alert.show pattern already used elsewhere in this file for a state change (see the menu
+-- toggles below). "latched" writes into the HUD's one badge slot, the same slot the prompt-mode
+-- target already uses (see showHUD/setBadge above), so the reminder stays on screen for as long
+-- as the hands-free recording runs rather than flashing and being missed. Both reuse existing
+-- plumbing; neither adds a new HUD element or a new kind of alert.
+local function latchArmedFeedback()
+    hs.alert.show("Scribe: latch armed, release to go hands-free", 1)
+end
+
+local function latchOnFeedback()
+    setBadge("LATCHED")
+    hs.alert.show("Scribe: latched, press PTT again to stop", 1.2)
+end
+
+-- Push-to-talk: watch the modifier without consuming it, so normal typing still works. The
+-- latch key (default left shift) is folded into the same event tap rather than a second one, so
+-- there is exactly one place that ever calls startRecording/stopRecording.
 scribe.ptt = hs.eventtap.new({ hs.eventtap.event.types.flagsChanged }, function(e)
-    if e:getKeyCode() == PTT_KEYCODE then
-        if e:getFlags()[PTT_FLAG] then startRecording() else stopRecording() end
+    local keyCode = e:getKeyCode()
+    local flags = e:getFlags()
+
+    if LATCH_ENABLED and keyCode == LATCH_KEYCODE then
+        -- Only the down edge of a tap matters: arm while PTT is actively held and not already
+        -- latched. Shift going back up on its own does nothing here, and types no character
+        -- either way, so this branch never needs to consume the event.
+        if flags[LATCH_FLAG] and scribe.recording and not scribe.latched then
+            scribe.latchArmed = true
+            latchArmedFeedback()
+        end
+        return false
+    end
+
+    if keyCode == PTT_KEYCODE then
+        if flags[PTT_FLAG] then
+            -- PTT key down.
+            if scribe.latched then
+                -- A second PTT press while latched stops the hands-free recording and finishes
+                -- it normally, through the exact same stopRecording() as every other release.
+                -- latchStopping marks that this press already did the job, so the matching
+                -- key-up (below) does not try to start or stop anything of its own.
+                scribe.latched = false
+                scribe.latchStopping = true
+                stopRecording()
+            else
+                startRecording()
+            end
+        else
+            -- PTT key up.
+            if scribe.latchStopping then
+                scribe.latchStopping = false          -- the stopping press's key-up: no-op
+            elseif scribe.latchArmed and scribe.recording then
+                -- Armed, and PTT is being released: keep recording hands-free instead of
+                -- stopping. stopRecording() is deliberately not called on this path.
+                scribe.latchArmed = false
+                scribe.latched = true
+                latchOnFeedback()
+            else
+                scribe.latchArmed = false
+                stopRecording()
+            end
+        end
     end
     return false
 end)
