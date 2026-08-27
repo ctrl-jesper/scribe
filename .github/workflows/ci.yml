@@ -17,7 +17,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y lua5.4
 
       - name: Parse-only check on dictate.lua
-        run: luac5.4 -p dictate.lua
+        run: |
+          # Debian names the compiler luac5.4, but a packaging change must never turn a
+          # missing tool into what looks like a syntax error: this gate is only useful if
+          # a red build always means dictate.lua is actually broken.
+          LUAC="$(command -v luac5.4 || command -v luac || true)"
+          if [ -z "$LUAC" ]; then
+            echo "No Lua compiler found after installing lua5.4, so the syntax gate could not run." >&2
+            exit 1
+          fi
+          "$LUAC" -p dictate.lua
 
   python-tests:
     name: Python test suites
