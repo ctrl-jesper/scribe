@@ -438,6 +438,27 @@ check("merge leaves clean prose untouched",
       sw.finalize_text(["run multiple agendas", "at the customer this quarter"], REPS),
       "run multiple agendas at the customer this quarter")
 
+# --- 5b. spoken punctuation: finalize_text is the streaming half of the shared chain ------
+# This is the call the maintainer's own recording path (streaming) actually makes; a feature
+# added only to pipeline.run()'s batch path would look completely broken to him.
+check("finalize_text applies tier 1 by default (cfg omitted), even across a chunk seam",
+      sw.finalize_text(["hello new", "paragraph world"], {}),
+      "hello\n\nworld")
+check("finalize_text still runs dictionary and collapse before the command converts",
+      sw.finalize_text(["the Akme deal", "new paragraph", "next section"], REPS),
+      "the Acme deal\n\nnext section")
+check("finalize_text leaves tier 2 off by default: 'period' stays a literal word",
+      sw.finalize_text(["the period of", "the loan"], {}),
+      "the period of the loan")
+_tier2_cfg = {"spoken_punctuation": {"enabled": True, "single_word_marks": True, "custom": {}}}
+check("finalize_text honours a tier-2-enabled cfg passed in from the worker",
+      sw.finalize_text(["wait comma", "that is wrong period"], {}, _tier2_cfg),
+      "wait, that is wrong.")
+_disabled_cfg = {"spoken_punctuation": {"enabled": False}}
+check("finalize_text honours spoken_punctuation.enabled=false",
+      sw.finalize_text(["hello new paragraph world"], {}, _disabled_cfg),
+      "hello new paragraph world")
+
 
 # emit() persists for the polish/recall hotkeys and reports whether the clipboard is fresh.
 # sw imports its own copy of pipeline (via stream_worker.py's top-level `import pipeline`),
@@ -581,6 +602,24 @@ def finish_capturing(texts, optimize_for=None, cfg=None, copy=False, polish=Fals
         return code, sys.stdout.getvalue(), sys.stderr.getvalue()
     finally:
         sys.stdout, sys.stderr = saved_out, saved_err
+
+
+# --- 6a2. spoken punctuation through the REAL streaming finish path (_finish), not just
+# finalize_text directly. This is what run_live/run_file actually call, so it is the closest
+# this test suite gets to proving the maintainer's own recording path gets the feature.
+_sp_code, _sp_out, _sp_err = finish_capturing(["hello new", "paragraph world"])
+check("the streaming finish path emits the paragraph break", _sp_code, 0)
+check("...with no stray double space or leftover command words", _sp_out, "hello\n\nworld\n")
+
+_sp_tier2_cfg = dict(CFG, spoken_punctuation={"enabled": True, "single_word_marks": True,
+                                              "custom": {}})
+_sp2_code, _sp2_out, _ = finish_capturing(["wait comma that is", "wrong period"],
+                                          cfg=_sp_tier2_cfg)
+check("the streaming finish path honours a tier-2-enabled cfg", _sp2_out, "wait, that is wrong.\n")
+
+_sp3_code, _sp3_out, _ = finish_capturing(["the period of the loan"])
+check("the streaming finish path leaves tier 2 off by default: 'period' stays literal",
+      _sp3_out, "the period of the loan\n")
 
 
 _saved_optimize = sw.pipeline.optimize_prompt

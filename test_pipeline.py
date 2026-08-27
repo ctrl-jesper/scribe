@@ -242,6 +242,155 @@ check("keep near-duplicate sentences",
       "Run the agenda. Run the agenda at the customer.")
 
 
+# --- spoken punctuation: config defaults ---------------------------------------------------
+check("tier 1 is on by default", p.DEFAULTS["spoken_punctuation"]["enabled"], True)
+check("tier 2 (single_word_marks) is off by default",
+      p.DEFAULTS["spoken_punctuation"]["single_word_marks"], False)
+check("no custom marks by default", p.DEFAULTS["spoken_punctuation"]["custom"], {})
+
+TIER1_CFG = None   # None still runs tier 1: see apply_spoken_punctuation's docstring
+
+# --- spoken punctuation: tier 1 happy paths, mid-sentence -----------------------------------
+check("new paragraph mid-sentence, no stray spaces",
+      p.apply_spoken_punctuation("hello new paragraph world", TIER1_CFG), "hello\n\nworld")
+check("new line mid-sentence, no stray spaces",
+      p.apply_spoken_punctuation("hello new line world", TIER1_CFG), "hello\nworld")
+check("open quote / close quote wrap the quoted words with no inner padding",
+      p.apply_spoken_punctuation(
+          "she said open quote hello there close quote to me", TIER1_CFG),
+      'she said "hello there" to me')
+check("open parenthesis / close parenthesis wrap with no inner padding",
+      p.apply_spoken_punctuation(
+          "he added open parenthesis a quick note close parenthesis to the file", TIER1_CFG),
+      "he added (a quick note) to the file")
+check("matching is case-insensitive",
+      p.apply_spoken_punctuation("Hello New Paragraph World", TIER1_CFG), "Hello\n\nWorld")
+
+# --- spoken punctuation: tier 1 happy paths, string start and end ---------------------------
+check("new paragraph at the very start",
+      p.apply_spoken_punctuation("new paragraph world", TIER1_CFG), "\n\nworld")
+check("new paragraph at the very end",
+      p.apply_spoken_punctuation("hello new paragraph", TIER1_CFG), "hello\n\n")
+check("new paragraph as the entire utterance",
+      p.apply_spoken_punctuation("new paragraph", TIER1_CFG), "\n\n")
+check("new line at the very start",
+      p.apply_spoken_punctuation("new line world", TIER1_CFG), "\nworld")
+check("new line at the very end",
+      p.apply_spoken_punctuation("hello new line", TIER1_CFG), "hello\n")
+
+# --- spoken punctuation: real whisper output tolerance ---------------------------------------
+# Verified against the real whisper-server (see the report): a spoken "new paragraph"/"new
+# line" that whisper hears as a natural pause gets ITS OWN trailing comma or period with no
+# space, e.g. "New paragraph, this is..." or "...the end new paragraph.". Both must still
+# produce a clean break, not a break with a stray comma or a lonely trailing period.
+check("a whisper-inserted comma right after the phrase is absorbed",
+      p.apply_spoken_punctuation("New paragraph, this is the second part.", TIER1_CFG),
+      "\n\nthis is the second part.")
+check("a whisper-inserted period right after the phrase is absorbed",
+      p.apply_spoken_punctuation("This is the first part new paragraph.", TIER1_CFG),
+      "This is the first part\n\n")
+check("the whole utterance being just the phrase plus a trailing period",
+      p.apply_spoken_punctuation("New paragraph.", TIER1_CFG), "\n\n")
+
+# --- spoken punctuation: tier 2 stays off by default, the whole point of the feature --------
+check("tier 2 off: 'period' used as an ordinary noun is left completely alone",
+      p.apply_spoken_punctuation("the period of the loan", TIER1_CFG), "the period of the loan")
+check("tier 2 off: 'colon' (the organ) is left completely alone",
+      p.apply_spoken_punctuation("the doctor checked my colon", TIER1_CFG),
+      "the doctor checked my colon")
+check("tier 2 off: 'comma' is left completely alone",
+      p.apply_spoken_punctuation("wait comma that is wrong", TIER1_CFG),
+      "wait comma that is wrong")
+
+# --- spoken punctuation: tier 2 opt-in, once enabled ------------------------------------------
+TIER2_CFG = {"spoken_punctuation": {"enabled": True, "single_word_marks": True, "custom": {}}}
+check("tier 2 on: comma and period attach to the previous word, no leading space",
+      p.apply_spoken_punctuation("wait comma that is wrong period", TIER2_CFG),
+      "wait, that is wrong.")
+check("tier 2 on: full stop, question mark, exclamation mark, colon, semicolon",
+      p.apply_spoken_punctuation(
+          "ship it full stop are you sure question mark absolutely exclamation mark "
+          "one thing colon do it semicolon done", TIER2_CFG),
+      "ship it. are you sure? absolutely! one thing: do it; done")
+
+# --- spoken punctuation: custom user-defined marks --------------------------------------------
+CUSTOM_CFG = {"spoken_punctuation": {"enabled": True, "single_word_marks": False,
+                                     "custom": {"smiley": ":)"}}}
+check("a custom mark attaches like a tier 2 mark",
+      p.apply_spoken_punctuation("that was funny smiley honestly", CUSTOM_CFG),
+      "that was funny:) honestly")
+check("a custom mark can override a built-in phrase of the same spelling",
+      p.apply_spoken_punctuation(
+          "wait comma now",
+          {"spoken_punctuation": {"enabled": True, "single_word_marks": True,
+                                  "custom": {"comma": "--"}}}),
+      "wait-- now")
+
+# --- spoken punctuation: the replacement is a function, never a template string --------------
+# Same lesson as apply_dictionary: a custom mark of "\1" must be inserted literally, not read
+# as a regex back-reference (which raises "invalid group reference" and breaks every dictation
+# until the entry is found).
+check("a custom mark containing a backslash group reference is inserted literally",
+      p.apply_spoken_punctuation("say backslash mark now",
+                                 {"spoken_punctuation": {"enabled": True,
+                                                         "custom": {"backslash mark": "\\1"}}}),
+      "say\\1 now")
+
+# --- spoken punctuation: the whole feature can be switched off ------------------------------
+check("enabled: false leaves even tier 1 phrases untouched",
+      p.apply_spoken_punctuation("hello new paragraph world",
+                                 {"spoken_punctuation": {"enabled": False}}),
+      "hello new paragraph world")
+
+# --- spoken punctuation: empty and None text are safe ----------------------------------------
+check("empty string is returned as-is", p.apply_spoken_punctuation("", TIER1_CFG), "")
+check("None is returned as-is", p.apply_spoken_punctuation(None, TIER1_CFG), None)
+
+# --- spoken punctuation: config validation, invalid types raise with file and key context ----
+_sp_not_object = home_with({"spoken_punctuation": "nope"})
+check_raises("spoken_punctuation as a non-object is rejected", RuntimeError,
+             load_config_in, _sp_not_object)
+_sp_msg = error_text(load_config_in, _sp_not_object)
+check("spoken_punctuation error names the config file",
+      os.path.join(_sp_not_object, "config.json") in _sp_msg, True)
+check("spoken_punctuation error names the key", "spoken_punctuation" in _sp_msg, True)
+
+check_raises("spoken_punctuation.enabled as a string is rejected", RuntimeError,
+             load_config_in, home_with({"spoken_punctuation": {"enabled": "yes"}}))
+check_raises("spoken_punctuation.single_word_marks as a string is rejected", RuntimeError,
+             load_config_in, home_with({"spoken_punctuation": {"single_word_marks": "yes"}}))
+check_raises("spoken_punctuation.custom as a list is rejected", RuntimeError,
+             load_config_in, home_with({"spoken_punctuation": {"custom": ["comma"]}}))
+check_raises("spoken_punctuation.custom with a non-string value is rejected", RuntimeError,
+             load_config_in, home_with({"spoken_punctuation": {"custom": {"smiley": 5}}}))
+check_raises("spoken_punctuation.custom with an empty-string key is rejected", RuntimeError,
+             load_config_in, home_with({"spoken_punctuation": {"custom": {"": ":)"}}}))
+
+# --- spoken punctuation: a partial override still gets the missing defaults back -------------
+# A plain dict.update would otherwise replace "spoken_punctuation" wholesale and silently drop
+# "enabled"/"custom" whenever a user sets only "single_word_marks" in their config.json.
+_partial_sp = load_config_in(home_with({"spoken_punctuation": {"single_word_marks": True}}))
+check("a partial spoken_punctuation override keeps enabled=true from the defaults",
+      _partial_sp["spoken_punctuation"]["enabled"], True)
+check("...and keeps custom={} from the defaults",
+      _partial_sp["spoken_punctuation"]["custom"], {})
+check("...while applying the one key the user actually set",
+      _partial_sp["spoken_punctuation"]["single_word_marks"], True)
+
+# --- spoken punctuation: clean_transcript is the one shared chain the batch path uses --------
+check("clean_transcript runs dictionary, then collapse, then spoken punctuation in that order",
+      p.clean_transcript("the akme deal new paragraph next section",
+                         {"akme": "Acme"}, TIER1_CFG),
+      "the Acme deal\n\nnext section")
+check("clean_transcript still collapses a stutter loop before converting the command",
+      p.clean_transcript(
+          "who are the people who are the people who are the people new paragraph next",
+          {}, TIER1_CFG),
+      "who are the people\n\nnext")
+check("clean_transcript with tier 2 off leaves an ordinary 'period' alone",
+      p.clean_transcript("the period of the loan", {}, TIER1_CFG), "the period of the loan")
+
+
 # --- config: the two new keys the installer writes ---------------------------------------
 check("ffmpeg_bin defaults to an absolute path resolved at load time",
       os.path.isabs(p.DEFAULTS["ffmpeg_bin"]), True)
