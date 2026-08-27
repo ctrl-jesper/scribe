@@ -115,6 +115,13 @@ Other actions:
   mark. If you want "comma", "period", "question mark" and the rest, set
   `"spoken_punctuation": {"single_word_marks": true}` in your config knowing that trade-off.
   Note that the transcriber already adds much of its own punctuation from your intonation.
+- **Second thoughts** - say "book the flight, scratch that, book the train" and only the train
+  survives; say "coffee at 2, actually 3" and you get 3. Deterministic and local, no AI call.
+  It is deliberately narrow, because "actually" is an ordinary word: a correction fires only
+  for an explicit retraction command, or when a number or time is replaced by another of the
+  same kind within a few words. "I actually think that's right" and "the 2 funds actually
+  performed well" pass through untouched. A retraction never reaches back past the start of the
+  current sentence, and never empties the text.
 - **Recall the last dictation** - `⌘⌥⌃L`. Restores your most recent result (plain or polished)
   to the clipboard and pastes it, even if you have copied something else since.
 - **Polish the last dictation** - `⌘⌥⌃P`, shown only if you enabled polish in setup. Runs the
@@ -168,6 +175,7 @@ wizard.
 | `mode` | `"dict"` or `"full"` | `"dict"` | Default pipeline: dictionary-only, or with AI polish. |
 | `polish_enabled` | boolean | `false` | Turns on the AI polish hotkey and menu item. |
 | `spoken_punctuation` | object | see below | Spoken punctuation commands. `enabled` (default `true`) covers the multi-word commands; `single_word_marks` (default `false`) adds the ambiguous single words; `custom` takes your own phrase-to-mark pairs. |
+| `second_thoughts` | object | all `true` | Spoken self-corrections. `retraction_commands` handles "scratch that"; `value_corrections` handles "at 2, actually 3". Either can be switched off on its own. |
 | `claude_bin` | string | `"~/.local/bin/claude"` | Path to the Claude CLI. |
 | `claude_model` | string | `"claude-haiku-4-5-20251001"` | Model used for the polish pass. |
 | `ffmpeg_bin` | string | resolved at install | Absolute path to ffmpeg. Written by the installer so the Homebrew prefix is correct on both Apple Silicon and Intel. |

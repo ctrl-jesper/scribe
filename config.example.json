@@ -19,6 +19,11 @@
     "single_word_marks": false,
     "custom": {}
   },
+  "second_thoughts": {
+    "enabled": true,
+    "retraction_commands": true,
+    "value_corrections": true
+  },
   "claude_bin": "~/.local/bin/claude",
   "claude_model": "claude-haiku-4-5-20251001",
   "ffmpeg_bin": "",
