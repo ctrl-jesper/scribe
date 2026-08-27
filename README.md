@@ -100,6 +100,21 @@ running the AI polish. If the drawn icon ever fails to render, it falls back to 
 
 Other actions:
 
+- **Hands-free (latch)** - while still holding the push-to-talk key, tap Left Shift. Let go of
+  push-to-talk and Scribe keeps recording without you holding anything; press push-to-talk
+  again to finish. Left Shift is the default because tapping it types no character, so the
+  gesture needs to intercept nothing and your normal typing is untouched. While latched, the
+  menu-bar icon carries a small marker, since a recording nobody is holding is one that is easy
+  to forget. Every recording, latched or not, stops and transcribes at `max_recording_seconds`
+  (15 minutes by default) rather than running indefinitely.
+- **Spoken punctuation** - say "new paragraph" or "new line" and get the break, plus "open
+  quote", "close quote", "open parenthesis" and "close parenthesis". Deterministic and local:
+  no AI call, no delay. Only these multi-word commands are on by default, because single words
+  are ambiguous in ordinary speech and the transcriber writes them out literally: "the period
+  of the loan" must not become "the . of the loan", and a colon is an organ before it is a
+  mark. If you want "comma", "period", "question mark" and the rest, set
+  `"spoken_punctuation": {"single_word_marks": true}` in your config knowing that trade-off.
+  Note that the transcriber already adds much of its own punctuation from your intonation.
 - **Recall the last dictation** - `⌘⌥⌃L`. Restores your most recent result (plain or polished)
   to the clipboard and pastes it, even if you have copied something else since.
 - **Polish the last dictation** - `⌘⌥⌃P`, shown only if you enabled polish in setup. Runs the
@@ -142,12 +157,17 @@ wizard.
 | `mic_name` | string | `""` | Microphone, matched by name so it survives device changes. |
 | `hotkey_keycode` | number | `61` | Push-to-talk key. See common values below. |
 | `hotkey_flag` | string | `"alt"` | The modifier flag that keycode raises (`alt`, `ctrl`, `cmd`, `shift`). |
+| `latch_enabled` | boolean | `true` | Hands-free lock: tap the latch key while holding push-to-talk to keep recording after you let go. |
+| `latch_keycode` | number | `56` | The latch key. Left Shift by default, chosen because tapping it types no character. |
+| `latch_flag` | string | `"shift"` | The modifier flag the latch keycode raises. |
+| `max_recording_seconds` | number | `900` | Safety cap on a single recording. On reaching it Scribe stops and transcribes normally, so a forgotten hands-free recording or a stuck key cannot run forever. |
 | `server_port` | number | `8090` | Port the local whisper-server listens on (localhost only). |
 | `model_file` | string | `"ggml-large-v3-turbo-q5_0.bin"` | Speech model filename. Baked into the launchd service at install time; no code reads this key at runtime, so editing it here has no effect. There is currently no supported way to switch models short of editing `install.sh` yourself. |
 | `vocabulary` | list of strings | `[]` | Names and terms boosted at transcription time. |
 | `speaker_note` | string | `""` | One line of speaker context, used only by the AI polish prompt. |
 | `mode` | `"dict"` or `"full"` | `"dict"` | Default pipeline: dictionary-only, or with AI polish. |
 | `polish_enabled` | boolean | `false` | Turns on the AI polish hotkey and menu item. |
+| `spoken_punctuation` | object | see below | Spoken punctuation commands. `enabled` (default `true`) covers the multi-word commands; `single_word_marks` (default `false`) adds the ambiguous single words; `custom` takes your own phrase-to-mark pairs. |
 | `claude_bin` | string | `"~/.local/bin/claude"` | Path to the Claude CLI. |
 | `claude_model` | string | `"claude-haiku-4-5-20251001"` | Model used for the polish pass. |
 | `ffmpeg_bin` | string | resolved at install | Absolute path to ffmpeg. Written by the installer so the Homebrew prefix is correct on both Apple Silicon and Intel. |

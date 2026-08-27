@@ -2,6 +2,34 @@
 
 All notable changes to Scribe are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Hands-free recording (latch).** Tap Left Shift while holding push-to-talk, and recording
+  continues after you release the key; press push-to-talk again to finish. Left Shift is the
+  default because tapping it types no character, so the gesture consumes no event and normal
+  typing, including Alt Gr brackets on a Nordic keyboard layout, is untouched. The menu-bar
+  icon carries a persistent marker while latched.
+- **A cap on recording length**, `max_recording_seconds`, 15 minutes by default. There was
+  none before. On reaching it Scribe stops and transcribes what you said rather than
+  discarding it, so neither a forgotten hands-free recording nor a stuck push-to-talk key can
+  record indefinitely.
+- **Spoken punctuation.** "new paragraph", "new line", "open quote", "close quote", "open
+  parenthesis" and "close parenthesis" become the marks themselves. Deterministic and local,
+  with no AI call. The ambiguous single words ("comma", "period", "colon") are available
+  behind `"spoken_punctuation": {"single_word_marks": true}` but stay off by default, because
+  they are ordinary words in ordinary speech.
+- **Continuous integration.** Every push and pull request now parses `dictate.lua` with a real
+  Lua 5.4 compiler and runs both Python test suites. A syntax error in the Hammerspoon script
+  used to be able to break every user's hotkey with nothing to catch it.
+
+### Changed
+
+- Both recording paths now share one deterministic cleanup function, `clean_transcript`, so
+  the batch and streaming paths cannot drift apart as features are added to one and not the
+  other.
+
 ## [0.4.1] - 2026-08-27
 
 ### Added
