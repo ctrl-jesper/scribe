@@ -27,6 +27,7 @@ if scribe then
     if scribe.recallHotkey then scribe.recallHotkey:delete() end
     if scribe.menu then scribe.menu:delete() end
     if scribe.cueTimer then scribe.cueTimer:stop() end
+    if scribe.maxDurationTimer then scribe.maxDurationTimer:stop() end
     if scribe.batchTimeout then scribe.batchTimeout:stop() end
     if scribe.animTimer then scribe.animTimer:stop() end          -- HUD morph / typing bounce / optimizing orbit
     if scribe.menuAnimTimer then scribe.menuAnimTimer:stop() end   -- menu-bar glyph animation
@@ -110,6 +111,20 @@ local PTT_FLAG       = configString(cfg.hotkey_flag) or "alt"   -- the modifier 
 local LATCH_ENABLED  = cfg.latch_enabled ~= false
 local LATCH_KEYCODE  = cfg.latch_keycode or 56           -- 56 = left shift
 local LATCH_FLAG     = configString(cfg.latch_flag) or "shift"
+
+-- Runaway-recording safety net: with no cap, a stuck-open PTT key (a driver glitch, a
+-- Bluetooth remote losing its release event) or a latched hands-free recording nobody
+-- remembers to stop would record forever. Applies to every recording, latched or not.
+local MAX_RECORDING_SECONDS = cfg.max_recording_seconds or 900   -- 900s = 15 minutes
+
+-- Phrases MAX_RECORDING_SECONDS for the on-screen alert: "15 minute" for the default and any
+-- other value that divides evenly into minutes, "100 second" for anything that does not.
+local function formatDurationLimit(seconds)
+    if seconds > 0 and seconds % 60 == 0 then
+        return string.format("%d minute", seconds / 60)
+    end
+    return string.format("%d second", seconds)
+end
 
 local POLISH_ENABLED = cfg.polish_enabled == true        -- optional LLM pass; hidden when off
 local CUE_SOUND      = hs.sound.getByName("Tink")
@@ -287,7 +302,7 @@ end
 local function showHUD()
     if not scribe.hud then scribe.hud = makeHUD() end
     for i = 1, BAR_COUNT do setBar(i, barFrame(i, MIN_BAR_H), false) end
-    -- The LATCHED target, not the live menu value: the badge must say what this dictation will
+    -- The FROZEN target, not the live menu value: the badge must say what this dictation will
     -- actually do. It stays up through the whole lifecycle, optimizing included.
     setBadge(PROMPT_BADGES[scribe.activePromptTarget])
     scribe.hud:alpha(1)
@@ -557,8 +572,17 @@ local function applyMenuIcon(image, fallbackText)
     end
 end
 
+-- The persistent hands-free marker: the HUD's badge stays reserved for the prompt-mode target
+-- (see showHUD/latchOnFeedback below), so the menu bar carries this instead, since it is always
+-- visible and competes with nothing else on screen. A plain text label set alongside whatever
+-- icon setMenuRecording draws, not a new icon shape: every menu-state setter below clears it
+-- unconditionally on entry, the same way each already fully owns scribe.menuAnimTimer, so it can
+-- never linger into the transcribing or idle state no matter which one runs next.
+local LATCH_MENU_LABEL = "⛓"
+
 local function setMenuIdle()
     if scribe.menuAnimTimer then scribe.menuAnimTimer:stop() end
+    if scribe.menu then scribe.menu:setTitle("") end
     applyMenuIcon(IDLE_ICON, "🎙️")
 end
 
@@ -571,24 +595,30 @@ end
 
 -- Reflects the SAME live level driving the HUD bars, polled at a modest rate, rather than a
 -- canned on/off toggle: a blink every N milliseconds has nothing to do with your actual voice.
-local function setMenuRecording()
+-- `latched`, when true, adds the persistent LATCH_MENU_LABEL described above; re-called with
+-- true once the latch actually engages (see latchOnFeedback), so the plain recording state and
+-- the hands-free state are the same animation with one added, always-visible label.
+local function setMenuRecording(latched)
     if scribe.menuAnimTimer then scribe.menuAnimTimer:stop() end
+    local fallback = latched and ("🔴" .. LATCH_MENU_LABEL) or "🔴"
     if not scribe.iconsOk then
-        applyMenuIcon(nil, "🔴")
+        applyMenuIcon(nil, fallback)
         return
     end
+    if scribe.menu then scribe.menu:setTitle(latched and LATCH_MENU_LABEL or "") end
     scribe.menuAnimTimer = hs.timer.doEvery(0.15, function()
         local heights = {}
         for i = 1, BAR_COUNT do
             local f = scribe.lastBarFrame and scribe.lastBarFrame[i]
             heights[i] = scaleToMenuBar(f and f.h or MIN_BAR_H)
         end
-        applyMenuIcon(makeMenuBars(heights), "🔴")
+        applyMenuIcon(makeMenuBars(heights), fallback)
     end)
 end
 
 local function setMenuTranscribing()
     if scribe.menuAnimTimer then scribe.menuAnimTimer:stop() end
+    if scribe.menu then scribe.menu:setTitle("") end
     if not scribe.iconsOk then
         applyMenuIcon(nil, "⏳")
         return
@@ -796,9 +826,9 @@ local function transcribeAndPaste()
     --   --consume         deletes the WAV once it has been read, so it cannot be reused.
     local args = { PIPELINE, WAV, "--copy", "--consume",
                    "--not-older-than", string.format("%d", scribe.sessionStart or 0) }
-    -- The LATCHED target and the LATCHED auto-polish, so a menu change made during
+    -- The FROZEN target and the FROZEN auto-polish, so a menu change made during
     -- transcription cannot redirect the run that is already under way. The two are mutually
-    -- exclusive by construction (see the latch in startRecording): pipeline.py refuses
+    -- exclusive by construction (see where startRecording freezes these): pipeline.py refuses
     -- --mode full together with --optimize-for.
     if scribe.activePromptTarget and scribe.activePromptTarget ~= "off" then
         args[#args + 1] = "--optimize-for"
@@ -888,6 +918,7 @@ local function batchRecorderFinished(exitCode, _, stderr)
         scribe.recording, scribe.cued = false, false
         scribe.latchArmed, scribe.latched = false, false   -- a stale latch would misread the next PTT press
         if scribe.cueTimer then scribe.cueTimer:stop() end
+        if scribe.maxDurationTimer then scribe.maxDurationTimer:stop() end
         if scribe.animTimer then scribe.animTimer:stop() end
         hideHUD(true)
         setMenuIdle()
@@ -908,6 +939,7 @@ local function streamWorkerFinished(exitCode, _, stderr)
         scribe.recording, scribe.cued = false, false
         scribe.latchArmed, scribe.latched = false, false   -- a stale latch would misread the next PTT press
         if scribe.cueTimer then scribe.cueTimer:stop() end
+        if scribe.maxDurationTimer then scribe.maxDurationTimer:stop() end
         finishTranscription()
         alertProblem("recording stopped unexpectedly (worker exit "
             .. tostring(exitCode) .. ")", 4)
@@ -943,6 +975,15 @@ local function streamWorkerFinished(exitCode, _, stderr)
     end
 end
 
+-- Forward-declared: the max-duration safety timer created inside startRecording() below needs
+-- to call the real stopRecording(), which is defined further down. A Lua closure resolves a
+-- name against whatever local already exists in scope at the point it is written, not at the
+-- point it runs, so without this the timer's callback would silently call a nonexistent global
+-- instead. Declaring the name here and assigning the function body later (where "local function
+-- stopRecording()" would otherwise be) is the standard idiom for two functions that need to
+-- call each other.
+local stopRecording
+
 local function startRecording()
     if scribe.recording then return end
     if scribe.transcribing then
@@ -955,10 +996,10 @@ local function startRecording()
         alertProblem("ffmpeg not found, run install.sh again", 4)
         return
     end
-    -- Latch the mode for this whole recording. Toggling streaming from the menu mid-recording
+    -- Freeze the mode for this whole recording. Toggling streaming from the menu mid-recording
     -- must not send the release down the other branch.
     scribe.activeStreaming = scribe.streaming
-    -- Same latch for the prompt-mode target, for the same reason: the badge, the argv and the
+    -- Same freeze for the prompt-mode target, for the same reason: the badge, the argv and the
     -- OPTIMIZING phase all have to agree with each other for the whole of THIS dictation.
     scribe.activePromptTarget = scribe.promptTarget
     -- And for auto-polish. Both gates from the menu are repeated here rather than trusted,
@@ -1052,12 +1093,32 @@ local function startRecording()
         scribe.workerPid = ok and pid or nil
     end
     scribe.cueTimer = hs.timer.doAfter(1.6, cueSpeak)              -- fallback cue if the stream callback misses it
+
+    -- The runaway-recording cap: must STOP AND TRANSCRIBE, never discard ("never lose the
+    -- user's words" per HANDOVER.md), so it goes through the exact same stopRecording() as
+    -- every other release. Cancelled in stopRecording() and in both recorder-death handlers
+    -- above, so a recording that ends any other way never leaves this timer to fire late.
+    scribe.maxDurationTimer = hs.timer.doAfter(MAX_RECORDING_SECONDS, function()
+        if not scribe.recording then return end   -- already stopped some other way
+        alertProblem("stopped at the " .. formatDurationLimit(MAX_RECORDING_SECONDS)
+            .. " limit, transcribing what you said", 3)
+        stopRecording()
+    end)
 end
 
-local function stopRecording()
+-- Assigns the forward-declared local above rather than "local function stopRecording()", so the
+-- max-duration timer's closure in startRecording() resolves to this same variable cell.
+stopRecording = function()
     if not scribe.recording then return end
     scribe.recording, scribe.cued = false, false
+    -- Any stop fully un-latches, however it was triggered, not only the interactive "PTT press
+    -- while latched" gesture below (which already clears these itself): the max-duration timer
+    -- above calls this directly, and without this line a forced stop of a latched recording
+    -- would leave scribe.latched stuck true, making the very next PTT press try to "stop" a
+    -- nonexistent recording instead of starting one.
+    scribe.latched, scribe.latchArmed = false, false
     if scribe.cueTimer then scribe.cueTimer:stop() end
+    if scribe.maxDurationTimer then scribe.maxDurationTimer:stop() end
     scribe.transcribing = true
     -- The bars sweep into dots and then bounce; that is the "transcribing" notice now, in both
     -- modes, so it starts on release rather than waiting for the recorder to exit.
@@ -1083,16 +1144,20 @@ end
 
 -- Latch feedback: "armed" is a one-shot cue at the moment of the gesture, the same
 -- hs.alert.show pattern already used elsewhere in this file for a state change (see the menu
--- toggles below). "latched" writes into the HUD's one badge slot, the same slot the prompt-mode
--- target already uses (see showHUD/setBadge above), so the reminder stays on screen for as long
--- as the hands-free recording runs rather than flashing and being missed. Both reuse existing
--- plumbing; neither adds a new HUD element or a new kind of alert.
+-- toggles below). "latched" needs to persist for as long as the hands-free recording runs, not
+-- just flash: the menu bar carries that (setMenuRecording's latched marker, always visible), and
+-- the HUD's one badge slot ALSO shows "LATCHED" only when no prompt-mode target is frozen for
+-- this dictation, since the badge's job is to say what will happen to the words, and pinning a
+-- rambling dictation for an LLM rewrite is exactly when someone wants hands-free most.
 local function latchArmedFeedback()
     hs.alert.show("Scribe: latch armed, release to go hands-free", 1)
 end
 
 local function latchOnFeedback()
-    setBadge("LATCHED")
+    if scribe.activePromptTarget == "off" then
+        setBadge("LATCHED")
+    end
+    setMenuRecording(true)
     hs.alert.show("Scribe: latched, press PTT again to stop", 1.2)
 end
 
