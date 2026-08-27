@@ -132,6 +132,9 @@ DEFAULTS = {
     # punctuation() for the full safety reasoning. "custom" lets a user add their own phrase ->
     # mark pairs, applied the same way as the tier 2 marks (attached to the previous word).
     "spoken_punctuation": {"enabled": True, "single_word_marks": False, "custom": {}},
+    # Both sub-features are deterministic and narrow (see resolve_second_thoughts() for the
+    # exact rules), so both default on, the same reasoning as spoken_punctuation's tier 1.
+    "second_thoughts": {"enabled": True, "retraction_commands": True, "value_corrections": True},
     "claude_bin": "~/.local/bin/claude",
     "claude_model": "claude-haiku-4-5-20251001",
     # Resolved from PATH at import rather than hardcoded, so an Intel Mac (/usr/local) works
@@ -254,7 +257,10 @@ def build_cleanup_prompt(cfg):
         "\n"
         "Your job: return a cleaned version of the SAME text.\n"
         "- Fix transcription errors, spelling, and punctuation.\n"
-        "- Remove filler words and collapse accidental verbatim repetitions into a single instance."
+        "- Remove filler words and collapse accidental verbatim repetitions into a single instance.\n"
+        "- Resolve spoken self-corrections and false starts (for example \"at 2, actually 3\" or "
+        "\"book the flight, scratch that, book the train\"), keeping only the speaker's final "
+        "intended wording or value."
         + vocab_rule + "\n"
         "\n"
         "Hard rules:\n"
@@ -470,6 +476,18 @@ def validate_config(cfg):
         if not isinstance(mark, str):
             _config_error("spoken_punctuation.custom", mark, "expected every value to be a string")
 
+    second = cfg.get("second_thoughts")
+    if not isinstance(second, dict):
+        _config_error("second_thoughts", second, "expected a JSON object")
+    if not isinstance(second.get("enabled"), bool):
+        _config_error("second_thoughts.enabled", second.get("enabled"), "expected true or false")
+    if not isinstance(second.get("retraction_commands"), bool):
+        _config_error("second_thoughts.retraction_commands", second.get("retraction_commands"),
+                      "expected true or false")
+    if not isinstance(second.get("value_corrections"), bool):
+        _config_error("second_thoughts.value_corrections", second.get("value_corrections"),
+                      "expected true or false")
+
     return cfg
 
 
@@ -494,6 +512,13 @@ def load_config():
             merged_sp = dict(DEFAULTS["spoken_punctuation"])
             merged_sp.update(cfg["spoken_punctuation"])
             cfg["spoken_punctuation"] = merged_sp
+        # Same reasoning, same fix, for "second_thoughts": a user who sets only
+        # {"value_corrections": false} must not silently lose "enabled" or
+        # "retraction_commands".
+        if isinstance(cfg.get("second_thoughts"), dict):
+            merged_st = dict(DEFAULTS["second_thoughts"])
+            merged_st.update(cfg["second_thoughts"])
+            cfg["second_thoughts"] = merged_st
     validate_config(cfg)
     # %d, not %s: even if validation were ever loosened, a non-number cannot reach the URL.
     cfg["server_url"] = "http://127.0.0.1:%d/inference" % cfg["server_port"]
@@ -865,6 +890,227 @@ def apply_spoken_punctuation(text, cfg=None):
     return regex.sub(_replace, text)
 
 
+# --------------------------------------------------------------------------------------
+# Second thoughts: resolve spoken self-corrections
+# --------------------------------------------------------------------------------------
+# Two deterministic, narrow cases only. Anything broader (rephrasing a clause, "the meeting is
+# Tuesday, actually Wednesday") is deliberately out of scope here; that belongs to the optional
+# LLM polish pass, see the added sentence in build_cleanup_prompt() above.
+#
+# The central danger driving the whole design: "actually" is an extremely common English
+# discourse marker ("I actually think that's right"). A naive rule here would destroy the
+# user's words on ordinary speech that has nothing to do with a correction. Conservatism beats
+# coverage every time: a missed correction is a minor annoyance, a false positive is data loss.
+# So case B only fires when a NUMBER or TIME sits close on BOTH sides of the trigger; a bare
+# "actually" with no flanking value pair is left completely untouched, whatever it says.
+#
+# Case A: retraction commands ("scratch that", "strike that", "forget that"). Delete from the
+# start of the CURRENT sentence through the trigger phrase. Never crosses a sentence boundary,
+# and never empties the whole text (see apply_retractions()'s docstring).
+#
+# Case B: same-type value correction ("coffee at 2, actually 3" -> "coffee at 3"). Requires a
+# NUMBER or TIME, a correction trigger, and ANOTHER value of the SAME kind, all close together
+# (see SECOND_THOUGHTS_MAX_GAP_WORDS). Different kinds (a number "corrected" by a time, or vice
+# versa) do nothing: that mismatch is a sign the trigger was not actually flanking a correction.
+
+_RETRACTION_PHRASES = ("scratch that", "strike that", "forget that")
+
+# Matched with re.IGNORECASE, one shared \b...\b regex over all three phrases (see
+# _phrase_regex, reused from the spoken-punctuation code above). An optional single trailing
+# punctuation mark plus whitespace is consumed with the phrase itself, the same "tolerate one
+# adjacent mark" trick apply_spoken_punctuation uses for its break commands: without it, "Scratch
+# that. Let's talk about Q3." would leave a stray leading period once "Scratch that" is deleted.
+_RETRACTION_RE = re.compile(
+    r"\b(?:%s)\b[,.!?]?\s*" % "|".join(_phrase_regex(p) for p in _RETRACTION_PHRASES),
+    re.IGNORECASE)
+
+
+def _sentence_start(text, before):
+    """Index just after the last sentence-ending punctuation mark before `before`, or 0.
+
+    "Sentence start" per the feature's spec: after the preceding [.!?], or the start of the
+    text if there is none. Used to stop a retraction from reaching back into a previous
+    sentence.
+    """
+    start = 0
+    for m in re.finditer(r"[.!?]", text[:before]):
+        start = m.end()
+    return start
+
+
+def _apply_retraction_once(text):
+    """Apply the first (leftmost) retraction command in `text`. Returns (text, applied)."""
+    m = _RETRACTION_RE.search(text)
+    if not m:
+        return text, False
+    start = _sentence_start(text, m.start())
+    prefix, remainder = text[:start], text[m.end():]
+    # Deleting [start:m.end()] removes whatever separated `prefix` from the retracted clause
+    # (a space, or nothing at all when start == 0). Put back exactly one space when both sides
+    # are real content and neither already supplies one, so "Hi there." + "let's continue." does
+    # not collide into "Hi there.let's continue."
+    if prefix and remainder and not prefix[-1].isspace() and not remainder[:1].isspace():
+        candidate = prefix + " " + remainder
+    else:
+        candidate = prefix + remainder
+    if not candidate.strip():
+        # Applying this would leave nothing at all. Pasting nothing is the one unacceptable
+        # outcome, so do nothing rather than that: leave the text exactly as it was.
+        return text, False
+    return candidate, True
+
+
+def apply_retractions(text, max_iterations=25):
+    """Resolve every "scratch that" / "strike that" / "forget that" in `text`.
+
+    Repeats so a chain ("book the flight, scratch that, book the train, strike that, book the
+    bus") resolves fully, not just one command at a time. max_iterations is a defensive cap,
+    not something normal dictation should ever reach: each application strictly shortens the
+    text (a matched phrase is at least "scratch that", 12 characters), so the loop already
+    terminates on its own.
+    """
+    if not text:
+        return text
+    for _ in range(max_iterations):
+        text, applied = _apply_retraction_once(text)
+        if not applied:
+            break
+    return text
+
+
+_CORRECTION_TRIGGERS = ("actually", "i mean", "sorry", "no wait", "make that")
+
+_CORRECTION_TRIGGER_RE = re.compile(
+    r"\b(?:%s)\b" % "|".join(_phrase_regex(p)
+                             for p in sorted(_CORRECTION_TRIGGERS, key=len, reverse=True)),
+    re.IGNORECASE)
+
+# Written-out cardinal numbers are supported only as single words (one..twenty, the bare tens
+# thirty..ninety, hundred, thousand). Compounds like "twenty-three" or "one hundred fifty" are
+# NOT merged into one value: each word matches on its own, which is a documented limitation, not
+# a bug. Verified empirically to work for the single-word case ("two" / "three", see the
+# worktree's second-thoughts-verify/ wav fixtures); untested and unclaimed beyond that.
+_WORD_NUMBERS = ("one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+                 "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+                 "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty", "sixty",
+                 "seventy", "eighty", "ninety", "hundred", "thousand")
+
+# A NUMBER is a plain digit value (optionally decimal, optionally "%"/"percent") or one of the
+# written-out words above. (?!\w) after the digit branch stops "2" matching inside "2nd": \d+
+# alone has no trailing \b there, since a bare \b\d+\b would also refuse to match a trailing "%"
+# (a transition from the non-word "%" to non-word whitespace is not a \b boundary either).
+_NUMBER_SRC = (r"\b\d+(?:\.\d+)?(?:\s*(?:%%|percent\b))?(?!\w)"
+              r"|\b(?:%s)\b" % "|".join(_WORD_NUMBERS))
+
+# A TIME requires an explicit clock marker, a colon or an am/pm suffix ("3:30", "3pm", "3:30
+# p.m."). A bare "2" or "3" is deliberately classified as NUMBER, not TIME: that is what makes
+# "coffee at 2, actually 3" a same-kind NUMBER pair rather than an unclassifiable one, and it
+# matches how whisper actually renders a spoken clock time in casual dictation (see the
+# empirical verification in the worktree report; whisper did not reliably produce a colon or
+# meridiem for a dictated "two o'clock" in testing, so this rule is deliberately permissive
+# about what still counts as a value at all, while staying strict about what counts as TIME
+# specifically).
+_TIME_SRC = (r"\b\d{1,2}:\d{2}\s*(?:[ap]\.?m\.?)?\b"
+            r"|\b\d{1,2}\s*[ap]\.?m\.?\b")
+
+# Named groups so a match can be classified without a second regex pass. TIME is listed first:
+# at the same start position "3:30" must consume the whole clock time, not just the leading "3"
+# as a bare NUMBER, and Python's re tries alternatives left to right.
+_VALUE_RE = re.compile(r"(?P<time>%s)|(?P<number>%s)" % (_TIME_SRC, _NUMBER_SRC), re.IGNORECASE)
+
+# How many words are allowed between a value and the trigger, on each side, for case B to fire
+# at all. Kept small and symmetric on purpose: a trigger word that is not genuinely flanking a
+# correction (the "I actually think that's right" danger) should fail this check long before it
+# fails anything else. 3 was chosen as generous enough for "coffee at 2 o'clock, actually let's
+# make it 3" (one filler clause) while still refusing a trigger and a value that just happen to
+# share a sentence.
+SECOND_THOUGHTS_MAX_GAP_WORDS = 3
+
+
+def _words_between(text, start, end):
+    """How many whitespace-separated tokens sit in text[start:end].
+
+    A crude measure: a lone comma between a value and the trigger counts as one "word" (it is
+    the only non-whitespace token in the slice), which makes the gap check slightly stricter
+    than a true word count, never looser. That is the safe direction for a conservative filter.
+    """
+    return len(text[start:end].split())
+
+
+def _apply_value_correction_once(text, max_gap):
+    """Apply the first (leftmost) qualifying value correction in `text`. Returns (text, applied).
+
+    A trigger qualifies only when it has a value match immediately (within max_gap words) on
+    each side, both of the SAME kind. The nearest preceding value and the nearest following
+    value are the only candidates considered for each trigger, so a value far away can never
+    pair with a trigger just because nothing closer happens to exist.
+    """
+    triggers = list(_CORRECTION_TRIGGER_RE.finditer(text))
+    if not triggers:
+        return text, False
+    values = list(_VALUE_RE.finditer(text))
+    if not values:
+        return text, False
+    for trig in triggers:
+        before = None
+        for v in values:
+            if v.end() <= trig.start():
+                before = v   # values are left to right, so the last one that fits is nearest
+        after = None
+        for v in values:
+            if v.start() >= trig.end():
+                after = v    # first one that fits, scanning left to right, is nearest
+                break
+        if before is None or after is None:
+            continue
+        before_kind = "time" if before.group("time") is not None else "number"
+        after_kind = "time" if after.group("time") is not None else "number"
+        if before_kind != after_kind:
+            continue   # a number "corrected" by a time (or vice versa) is not this pattern
+        if _words_between(text, before.end(), trig.start()) > max_gap:
+            continue
+        if _words_between(text, trig.end(), after.start()) > max_gap:
+            continue
+        # The second value replaces the first: keep only its own matched text (so "15 percent,
+        # I mean 20 percent" becomes "20 percent", not "15 percent 20 percent" or a bare "20").
+        replacement = text[after.start():after.end()]
+        return text[:before.start()] + replacement + text[after.end():], True
+    return text, False
+
+
+def apply_value_corrections(text, max_gap=SECOND_THOUGHTS_MAX_GAP_WORDS, max_iterations=25):
+    """Resolve every same-type value correction in `text` (case B).
+
+    Repeats so a chain ("coffee at 2, actually 3, no wait 4") resolves down to the final value,
+    not just the first correction. Terminates on its own (each application removes at least the
+    trigger word), max_iterations is a defensive cap only.
+    """
+    if not text:
+        return text
+    for _ in range(max_iterations):
+        text, applied = _apply_value_correction_once(text, max_gap)
+        if not applied:
+            break
+    return text
+
+
+def resolve_second_thoughts(text, cfg=None):
+    """Resolve spoken self-corrections: retraction commands (case A), then value corrections
+    (case B). `cfg` is the loaded config dict; None or a partial dict still runs both, the same
+    "defaults to enabled" behaviour as apply_spoken_punctuation.
+    """
+    if not text:
+        return text
+    settings = (cfg or {}).get("second_thoughts") or {}
+    if not settings.get("enabled", True):
+        return text
+    if settings.get("retraction_commands", True):
+        text = apply_retractions(text)
+    if settings.get("value_corrections", True):
+        text = apply_value_corrections(text)
+    return text
+
+
 def clean_transcript(text, replacements, cfg=None):
     """The one deterministic cleanup chain the batch and streaming paths both call.
 
@@ -879,7 +1125,10 @@ def clean_transcript(text, replacements, cfg=None):
       2. collapse_repetitions      - runs while the text is still a single line with no marks
                                      inserted yet, which is what its own word-splitting logic
                                      assumes (see its docstring).
-      3. apply_spoken_punctuation  - runs last, after the words have settled, and is the only
+      3. resolve_second_thoughts   - needs settled, single-line text to find sentence
+                                     boundaries and value pairs, and must run before any mark
+                                     or newline exists so it never mistakes one for a word.
+      4. apply_spoken_punctuation  - runs last, after the words have settled, and is the only
                                      step that may introduce newlines into the result.
 
     That last point is a deliberate, narrow exception to the "clipboard text is always a
@@ -889,6 +1138,7 @@ def clean_transcript(text, replacements, cfg=None):
     """
     text = apply_dictionary(text, replacements)
     text = collapse_repetitions(text)
+    text = resolve_second_thoughts(text, cfg)
     return apply_spoken_punctuation(text, cfg)
 
 
