@@ -126,6 +126,12 @@ DEFAULTS = {
     "speaker_note": "",
     "mode": "dict",
     "polish_enabled": False,
+    # Tier 1 (enabled) is multi-word commands nobody says by accident ("new paragraph").
+    # Tier 2 (single_word_marks) is the ambiguous single words ("period", "colon", ...) that
+    # whisper already tends to write out literally in ordinary speech; see apply_spoken_
+    # punctuation() for the full safety reasoning. "custom" lets a user add their own phrase ->
+    # mark pairs, applied the same way as the tier 2 marks (attached to the previous word).
+    "spoken_punctuation": {"enabled": True, "single_word_marks": False, "custom": {}},
     "claude_bin": "~/.local/bin/claude",
     "claude_model": "claude-haiku-4-5-20251001",
     # Resolved from PATH at import rather than hardcoded, so an Intel Mac (/usr/local) works
@@ -444,6 +450,26 @@ def validate_config(cfg):
     if not isinstance(cfg.get("polish_enabled"), bool):
         _config_error("polish_enabled", cfg.get("polish_enabled"), "expected true or false")
 
+    spoken = cfg.get("spoken_punctuation")
+    if not isinstance(spoken, dict):
+        _config_error("spoken_punctuation", spoken, "expected a JSON object")
+    if not isinstance(spoken.get("enabled"), bool):
+        _config_error("spoken_punctuation.enabled", spoken.get("enabled"),
+                      "expected true or false")
+    if not isinstance(spoken.get("single_word_marks"), bool):
+        _config_error("spoken_punctuation.single_word_marks", spoken.get("single_word_marks"),
+                      "expected true or false")
+    custom = spoken.get("custom", {})
+    if not isinstance(custom, dict):
+        _config_error("spoken_punctuation.custom", custom,
+                      "expected a JSON object of phrase: mark pairs")
+    for phrase, mark in custom.items():
+        if not isinstance(phrase, str) or not phrase.strip():
+            _config_error("spoken_punctuation.custom", phrase,
+                          "expected every key to be a non-empty phrase")
+        if not isinstance(mark, str):
+            _config_error("spoken_punctuation.custom", mark, "expected every value to be a string")
+
     return cfg
 
 
@@ -460,6 +486,14 @@ def load_config():
             raise RuntimeError("invalid config in %s: expected a JSON object, got %s"
                                % (CONFIG_PATH, type(user_cfg).__name__))
         cfg.update(user_cfg)
+        # A plain dict.update replaces "spoken_punctuation" wholesale, so a user who sets only
+        # {"single_word_marks": true} would silently lose "enabled" and "custom". Fill the
+        # missing sub-keys back in from the defaults before validating. A non-dict value is
+        # left as-is so validate_config raises its normal "expected a JSON object" error.
+        if isinstance(cfg.get("spoken_punctuation"), dict):
+            merged_sp = dict(DEFAULTS["spoken_punctuation"])
+            merged_sp.update(cfg["spoken_punctuation"])
+            cfg["spoken_punctuation"] = merged_sp
     validate_config(cfg)
     # %d, not %s: even if validation were ever loosened, a non-number cannot reach the URL.
     cfg["server_url"] = "http://127.0.0.1:%d/inference" % cfg["server_port"]
@@ -680,6 +714,182 @@ def collapse_repetitions(text):
     clipboard may contain a newline.
     """
     return _collapse_duplicate_sentences(_collapse_token_runs(text))
+
+
+# --------------------------------------------------------------------------------------
+# Spoken punctuation
+# --------------------------------------------------------------------------------------
+# Deterministic, no LLM call: the speaker says a command word and it becomes a literal mark.
+#
+# The whole design is a safety problem, not a matching problem: whisper already inserts its
+# own punctuation, and a single ambiguous word is dangerous to convert unconditionally. "the
+# period of the loan" must never become "the . of the loan", and "colon" is an organ before
+# it is ever a punctuation mark. So the marks are split into two tiers:
+#
+#   Tier 1 (always on): multi-word commands nobody says by accident in ordinary speech
+#   ("new paragraph", "open quote"). Safe to translate unconditionally.
+#   Tier 2 (opt-in, "single_word_marks"): the ambiguous single words ("comma", "period",
+#   "colon", ...). Off by default; a user who wants them turns them on knowing the trade-off.
+#
+# Verified against real whisper-server output (python3 pipeline.py against `say`-synthesized
+# audio, see the worktree's punct-verify/ fixtures): "the period of the loan" transcribes with
+# "period" left as a literal word, never silently turned into ".", so tier 2 has something
+# real to act on when a user opts in. The same run showed whisper inserting its OWN comma or
+# period immediately after a spoken "new paragraph"/"new line" when it hears a natural pause
+# there (e.g. "new paragraph, this is..."), which is why the break commands below tolerate one
+# adjacent comma or period with no space of its own; without that, a real dictation would leave
+# a stray comma right after an inserted break.
+_BREAK_TRAIL = r"\s*[,.]?\s*"     # tolerate one whisper-inserted comma/period after a break
+_PLAIN_TRAIL = r"\s*"
+
+# (phrase, kind, mark). kind controls how the surrounding whitespace is rewritten:
+#   "break" - the phrase and everything whitespace/punctuation-ish around it becomes the mark
+#             alone: "hello new paragraph world" -> "hello" + mark + "world", no added spaces.
+#   "open"  - keeps at most one leading space (there is none to keep at the start of a line),
+#             drops the trailing space so the next word sits directly against the mark: "open
+#             quote hello" -> ' "hello'.
+#   "attach"- the mirror of "open": drops the leading space so the mark sits directly against
+#             the previous word, keeps at most one trailing space: "hello comma world" ->
+#             "hello, world".
+_TIER1_COMMANDS = (
+    ("new paragraph", "break", "\n\n"),
+    ("new line", "break", "\n"),
+    ("open quote", "open", '"'),
+    ("close quote", "attach", '"'),
+    ("open parenthesis", "open", "("),
+    ("close parenthesis", "attach", ")"),
+)
+
+# Off by default. A user turns these on via "spoken_punctuation": {"single_word_marks": true}
+# in config.json, understanding that "comma", "period" etc. are also ordinary words.
+_TIER2_COMMANDS = (
+    ("comma", "attach", ","),
+    ("period", "attach", "."),
+    ("full stop", "attach", "."),
+    ("question mark", "attach", "?"),
+    ("exclamation mark", "attach", "!"),
+    ("colon", "attach", ":"),
+    ("semicolon", "attach", ";"),
+)
+
+
+def _phrase_regex(phrase):
+    """Word-boundary regex source for a (possibly multi-word) phrase.
+
+    Words are joined with \\s+ rather than a literal space so "new  paragraph" (an accidental
+    double space) still matches.
+    """
+    return r"\s+".join(re.escape(word) for word in phrase.split())
+
+
+def _compile_spoken_punctuation(commands):
+    """One combined regex over every active command, plus what each capture group means.
+
+    A single combined regex, matched left to right in one pass, so a substitution never gets
+    re-scanned by a later command's pattern; running the commands one at a time with separate
+    re.sub calls (like apply_dictionary does for the dictionary) would let a later command's
+    leading-whitespace match eat the newline an earlier command had just inserted.
+
+    Returns (compiled_regex, command_by_group) or (None, {}) if `commands` is empty.
+    """
+    if not commands:
+        return None, {}
+    # Longest phrase first, so a future custom phrase that happens to start with an existing
+    # one (there is no such built-in pair today) cannot shadow the longer, more specific match.
+    ordered = sorted(commands, key=lambda c: len(c[0]), reverse=True)
+    alternatives = []
+    command_by_group = {}
+    for i, (phrase, kind, mark) in enumerate(ordered):
+        trail_pattern = _BREAK_TRAIL if kind == "break" else _PLAIN_TRAIL
+        group = "c%d" % i
+        alternatives.append(
+            r"(?P<%s>(?P<lead%d>\s*)\b%s\b(?P<trail%d>%s))"
+            % (group, i, _phrase_regex(phrase), i, trail_pattern))
+        command_by_group[group] = (i, kind, mark)
+    return re.compile("|".join(alternatives), re.IGNORECASE), command_by_group
+
+
+def _spoken_punctuation_commands(settings):
+    """The active (phrase, kind, mark) list for one `spoken_punctuation` config block.
+
+    Tier 1 always included. Tier 2 only when "single_word_marks" is true. "custom" entries are
+    applied last (so they can override a tier 1/2 phrase of the same spelling) and behave like
+    a tier 2 mark: attached to the previous word, since they are punctuation-style additions by
+    the same logic. Keyed by lowercased phrase so a later entry for the same phrase replaces
+    an earlier one instead of adding a second, redundant alternative to the regex.
+    """
+    by_phrase = {}
+    for phrase, kind, mark in _TIER1_COMMANDS:
+        by_phrase[phrase.lower()] = (phrase, kind, mark)
+    if settings.get("single_word_marks"):
+        for phrase, kind, mark in _TIER2_COMMANDS:
+            by_phrase[phrase.lower()] = (phrase, kind, mark)
+    for phrase, mark in (settings.get("custom") or {}).items():
+        phrase = phrase.strip()
+        if phrase:
+            by_phrase[phrase.lower()] = (phrase, "attach", mark)
+    return list(by_phrase.values())
+
+
+def apply_spoken_punctuation(text, cfg=None):
+    """Translate spoken punctuation commands ("new paragraph", ...) into literal marks.
+
+    `cfg` is the loaded config dict (or None/partial, in which case tier 1 is still on: the
+    feature defaults to enabled). Every replacement is produced by a function, not a template
+    string, for the same reason as apply_dictionary: a custom mark containing "\\1" would
+    otherwise raise "invalid group reference" instead of being inserted literally.
+
+    Deliberately does NOT implement spoken numbered lists ("one... two... three" -> a numbered
+    list): that is a false-positive machine (ordinary counting speech would trigger it) and was
+    left out of this feature on purpose.
+    """
+    if not text:
+        return text
+    settings = (cfg or {}).get("spoken_punctuation") or {}
+    if not settings.get("enabled", True):
+        return text
+    regex, command_by_group = _compile_spoken_punctuation(_spoken_punctuation_commands(settings))
+    if regex is None:
+        return text
+
+    def _replace(m):
+        for group, (i, kind, mark) in command_by_group.items():
+            if m.group(group) is not None:
+                if kind == "break":
+                    return mark
+                if kind == "open":
+                    return (" " if m.group("lead%d" % i) else "") + mark
+                return mark + (" " if m.group("trail%d" % i) else "")
+        return m.group(0)   # unreachable: a match always belongs to exactly one alternative
+
+    return regex.sub(_replace, text)
+
+
+def clean_transcript(text, replacements, cfg=None):
+    """The one deterministic cleanup chain the batch and streaming paths both call.
+
+    stream_worker.py's finalize_text() and this module's run() call this single function
+    instead of chaining apply_dictionary/collapse_repetitions/apply_spoken_punctuation
+    separately, so the two recording paths can never drift out of sync again: a step added
+    here reaches both automatically.
+
+    Order matters:
+      1. apply_dictionary          - fix known mishearings first, in case a mis-transcribed
+                                     word is itself a spoken-punctuation phrase.
+      2. collapse_repetitions      - runs while the text is still a single line with no marks
+                                     inserted yet, which is what its own word-splitting logic
+                                     assumes (see its docstring).
+      3. apply_spoken_punctuation  - runs last, after the words have settled, and is the only
+                                     step that may introduce newlines into the result.
+
+    That last point is a deliberate, narrow exception to the "clipboard text is always a
+    single line" rule collapse_repetitions documents: "new paragraph" exists specifically to
+    put a line break on the clipboard. It is still contained: apply_spoken_punctuation is the
+    only place a newline can enter the pipeline, and only when the speaker asked for one.
+    """
+    text = apply_dictionary(text, replacements)
+    text = collapse_repetitions(text)
+    return apply_spoken_punctuation(text, cfg)
 
 
 # --------------------------------------------------------------------------------------
@@ -1013,8 +1223,7 @@ def run(wav_path, mode, cfg, timings=False, max_age=DEFAULT_MAX_AGE_S,
     raw = transcribe(wav_path, cfg["server_url"], cfg["language"], cfg.get("prompt", "")); t["transcribe"] = time.time() - t0
     replacements = load_replacements()
     t1 = time.time()
-    text = apply_dictionary(raw, replacements)
-    text = collapse_repetitions(text); t["dictionary"] = time.time() - t1
+    text = clean_transcript(raw, replacements, cfg); t["dictionary"] = time.time() - t1
     if consume:
         # The audio has now been turned into text; removing it is what stops a failed
         # recording later being transcribed a second time and pasted as if it were new.

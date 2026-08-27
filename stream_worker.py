@@ -369,14 +369,19 @@ class StreamSession:
         return (start, end)
 
 
-def finalize_text(chunk_texts, replacements):
+def finalize_text(chunk_texts, replacements, cfg=None):
     """Join the chunks with single spaces, then clean the merged text ONCE.
 
-    Running the dictionary and the loop collapser per chunk would miss a name or a stutter
-    that straddles a chunk seam, and would treat each seam as a sentence break it is not.
+    Running the dictionary, the loop collapser, and spoken punctuation per chunk would miss a
+    name or a stutter that straddles a chunk seam, and would treat each seam as a sentence
+    break it is not. pipeline.clean_transcript is the exact same function pipeline.run() calls
+    for the batch path: the maintainer runs streaming, so this is the call that matters most,
+    and routing both paths through one function is what keeps them from drifting apart again.
+    `cfg` defaults to None, which still runs tier 1 spoken punctuation (on by default); callers
+    that have a loaded config should pass it so tier 2 / custom marks are honoured too.
     """
     merged = " ".join(t.strip() for t in chunk_texts if t.strip())
-    return pipeline.collapse_repetitions(pipeline.apply_dictionary(merged, replacements))
+    return pipeline.clean_transcript(merged, replacements, cfg)
 
 
 def emit(text, copy=False):
@@ -842,7 +847,7 @@ def _finish(session, transcriber, cfg, copy, timings, t_release, extra, optimize
         return EXIT_FAIL
 
     text = finalize_text(transcriber.texts_in_order(session.chunk_count),
-                         pipeline.load_replacements())
+                         pipeline.load_replacements(), cfg)
     if pipeline.is_effectively_empty(text):
         # Nothing was said (or whisper returned only [BLANK_AUDIO]); dictate.lua resets
         # quietly. Exiting 0 here would paste the previous clipboard contents.
