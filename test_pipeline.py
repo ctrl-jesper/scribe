@@ -162,9 +162,18 @@ enabled_missing_bin = dict(cfg, polish_enabled=True)   # claude_bin still points
 check("polish blocked when claude_bin does not exist",
       p.polish_blocked_reason(enabled_missing_bin) is not None, True)
 real_bin = os.path.join(SCRIBE_HOME, "fake-claude")
-open(real_bin, "w").close()
+open(real_bin, "w").close()                       # exists, but not executable yet
 enabled_real_bin = dict(cfg, polish_enabled=True, claude_bin=real_bin)
-check("polish unblocked once enabled with an existing claude_bin",
+# A claude_bin that exists but cannot be executed used to pass this check and then raise
+# PermissionError out of subprocess.run. On the automatic paths that lost the dictation
+# outright, so being unrunnable has to block here, exactly like being absent.
+check("polish blocked when claude_bin exists but is not executable",
+      p.polish_blocked_reason(enabled_real_bin) is not None, True)
+check("the not-executable reason names the file and says why",
+      (real_bin in p.polish_blocked_reason(enabled_real_bin),
+       "not executable" in p.polish_blocked_reason(enabled_real_bin)), (True, True))
+os.chmod(real_bin, os.stat(real_bin).st_mode | stat.S_IEXEC)
+check("polish unblocked once enabled with an executable claude_bin",
       p.polish_blocked_reason(enabled_real_bin), None)
 
 
@@ -463,9 +472,28 @@ os.environ["SCRIBE_TEST_CAPTURE"] = CAPTURE
 os.environ["SCRIBE_TEST_CWD"] = CWD_CAPTURE
 _polish_cfg = dict(p.DEFAULTS, polish_enabled=True, claude_bin=_fake_claude,
                    vocabulary=["Acme"], speaker_note="Speaks fast")
-_polished = p.llm_polish("hello there", _polish_cfg)
+
+
+def polish_capturing(fn, *args):
+    """Run `fn` with stdout and stderr captured. Returns (result, stdout, stderr).
+
+    The polish path prints its POLISHING phase marker on stdout, so every call goes through
+    here; calling bare would scatter marker lines through the test report.
+    """
+    saved_out, saved_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+    try:
+        result = fn(*args)
+        return result, sys.stdout.getvalue(), sys.stderr.getvalue()
+    finally:
+        sys.stdout, sys.stderr = saved_out, saved_err
+
+
+_polished, _polish_out, _ = polish_capturing(p.llm_polish, "hello there", _polish_cfg)
 check("polish output is collapsed to a single line", "\n" in _polished, False)
 check("polish output keeps the words", _polished, "line one line one line two")
+check("the polish announces itself with the POLISHING marker",
+      _polish_out, p.PHASE_POLISHING + "\n")
 _sent = open(CAPTURE).read()
 check("the fence reached the CLI", _sent.count("<<<SCRIBE-DICTATION-"), 2)
 _polish_cwd = open(CWD_CAPTURE).read().strip()
@@ -475,9 +503,61 @@ check("polish runs outside $HOME so no CLAUDE.md is discovered above it",
 check("the polish working directory is cleaned up", os.path.exists(_polish_cwd), False)
 
 _failing_claude = write_script("failing-claude", "cat > /dev/null\nexit 1\n")
-check("a failing polish falls back to the unpolished words",
-      p.llm_polish("keep my words", dict(_polish_cfg, claude_bin=_failing_claude)),
-      "keep my words")
+_failed_polish, _failed_out, _failed_err = polish_capturing(
+    p.llm_polish, "keep my words", dict(_polish_cfg, claude_bin=_failing_claude))
+check("a failing polish falls back to the unpolished words", _failed_polish, "keep my words")
+check("the marker was still printed before that failed call",
+      _failed_out, p.PHASE_POLISHING + "\n")
+check("the failed polish says so on stderr", "[llm_polish fallback]" in _failed_err, True)
+
+# --- auto-polish: telling "cleaned" from "fell back" apart ----------------------------------
+# llm_polish must keep returning text and only text (--polish-last depends on that), so the
+# flag lives in a second entry point that the dictation paths call instead.
+check("a successful polish reports that it happened",
+      polish_capturing(p.polish_with_status, "hello there", _polish_cfg)[0],
+      ("line one line one line two", True))
+check("a failed polish returns the unpolished text and says it fell back",
+      polish_capturing(p.polish_with_status, "keep my words",
+                       dict(_polish_cfg, claude_bin=_failing_claude))[0],
+      ("keep my words", False))
+_empty_claude = write_script("empty-claude", 'cat > /dev/null\nprintf ""\n')
+check("an empty polish answer falls back too",
+      polish_capturing(p.polish_with_status, "keep my words",
+                       dict(_polish_cfg, claude_bin=_empty_claude))[0],
+      ("keep my words", False))
+
+
+# --- auto-polish: the phase marker is printed BEFORE the polish CLI is invoked ---------------
+# Same spy technique as the OPTIMIZING test below: subprocess.run reads stdout at the moment it
+# is called, which proves the ordering rather than just the presence of the marker.
+_polish_stdout_at_call = []
+_saved_polish_run = p.subprocess.run
+
+
+def _polish_spy_run(*_args, **_kwargs):
+    _polish_stdout_at_call.append(sys.stdout.getvalue())
+    return types.SimpleNamespace(returncode=0, stdout="cleaned words", stderr="")
+
+
+p.subprocess.run = _polish_spy_run
+_spy_polish, _spy_polish_out, _ = polish_capturing(p.polish_with_status, "some words", _polish_cfg)
+p.subprocess.run = _saved_polish_run
+check("stdout already carried the POLISHING line when the polish CLI was invoked",
+      _polish_stdout_at_call, [p.PHASE_POLISHING + "\n"])
+check("the marker is the only thing the polish prints",
+      _spy_polish_out, p.PHASE_POLISHING + "\n")
+check("the polished text is returned, not printed", _spy_polish, ("cleaned words", True))
+
+
+# --- auto-polish: nothing is printed when the polish is never invoked -------------------------
+p.write_state(p.LAST_PATH, "the previous instant dictation")
+_pl_blocked, _pl_blocked_out, _pl_blocked_err = polish_capturing(
+    p.polish_last, dict(p.DEFAULTS, polish_enabled=False))
+check("a blocked polish_last returns the unpolished words",
+      _pl_blocked, "the previous instant dictation")
+check("no POLISHING marker when the polish CLI is never invoked",
+      p.PHASE_POLISHING in _pl_blocked_out, False)
+check("the blocked polish says why on stderr", "[polish skipped]" in _pl_blocked_err, True)
 
 
 # --- prompt mode: the optimizer system prompt -----------------------------------------------
@@ -897,6 +977,140 @@ check("the unoptimized words survive an empty answer too",
       open(CLIPBOARD).read(), "words that survive an empty rewrite")
 check("exit 4 is distinct from the failure and empty codes",
       (p.EXIT_OPTIMIZER_FALLBACK, p.EXIT_FAIL, p.EXIT_EMPTY), (4, 1, 3))
+
+
+# --- auto-polish end to end: --mode full, the marker, the clipboard, and exit 5 ---------------
+# One home per outcome, each pointing claude_bin at a different fake CLI, so no config is
+# rewritten between runs.
+def polish_home(claude_bin, prefix, polish_enabled=True, mode=None):
+    config = {"server_port": STUB_PORT, "vocabulary": [], "claude_bin": claude_bin,
+              "polish_enabled": polish_enabled}
+    if mode:
+        config["mode"] = mode
+    return home_with(config, {"replacements": {}}, prefix=prefix)
+
+
+POLISH_OK_HOME = polish_home(_fake_claude, "scribe-test-polish-ok-")
+POLISH_FAIL_HOME = polish_home(_failing_claude, "scribe-test-polish-fail-")
+POLISH_OFF_HOME = polish_home(_fake_claude, "scribe-test-polish-off-", polish_enabled=False)
+POLISHED = "line one line one line two"          # what the fake claude answers, once collapsed
+
+StubWhisper.text = "the words as spoken"
+_full = run_cli([recorded_wav(POLISH_OK_HOME), "--mode", "full", "--copy"], home=POLISH_OK_HOME)
+check("--mode full exits 0 when the polish runs", _full.returncode, 0)
+check("the POLISHING marker is the first stdout line",
+      _full.stdout.splitlines()[0], p.PHASE_POLISHING)
+check("the polished text follows the marker on stdout",
+      "\n".join(_full.stdout.splitlines()[1:]).strip(), POLISHED)
+check("the polished text is what reaches the clipboard", open(CLIPBOARD).read(), POLISHED)
+check("the pre-polish transcript is still kept for the polish hotkey",
+      cli_state("last-dict.txt", POLISH_OK_HOME), "the words as spoken")
+
+StubWhisper.text = "words that must survive a failed polish"
+_full_fb = run_cli([recorded_wav(POLISH_FAIL_HOME), "--mode", "full", "--copy"],
+                   home=POLISH_FAIL_HOME)
+check("a failing polish gives exit code 5", _full_fb.returncode, p.EXIT_POLISH_FALLBACK)
+check("the unpolished words are still printed",
+      "words that must survive a failed polish" in _full_fb.stdout, True)
+check("the unpolished words are still on the clipboard",
+      open(CLIPBOARD).read(), "words that must survive a failed polish")
+check("the marker was printed before that failed polish call",
+      p.PHASE_POLISHING in _full_fb.stdout, True)
+check("the polish fallback is logged",
+      "POLISH-FALLBACK" in cli_state("scribe.log", POLISH_FAIL_HOME), True)
+
+# A polish switched off in config is a setting, not a failure. A hand-edited "mode": "full"
+# with "polish_enabled": false has always exited 0 quietly, and must keep doing so: exiting 5
+# there would make dictate.lua alert on every single dictation, forever.
+StubWhisper.text = "words with the polish switched off"
+_full_off = run_cli([recorded_wav(POLISH_OFF_HOME), "--mode", "full", "--copy"],
+                    home=POLISH_OFF_HOME)
+check("--mode full with polish_enabled false still exits 0", _full_off.returncode, 0)
+check("no POLISHING marker when the polish CLI is never invoked",
+      p.PHASE_POLISHING in _full_off.stdout, False)
+check("the words reach the clipboard anyway",
+      open(CLIPBOARD).read(), "words with the polish switched off")
+
+# Enabled but unavailable IS a fallback: the user asked for a polish and did not get one.
+POLISH_GONE_HOME = polish_home(os.path.join(FAKE_BIN, "no-such-claude"),
+                               "scribe-test-polish-gone-")
+StubWhisper.text = "words the missing CLI could not polish"
+_full_gone = run_cli([recorded_wav(POLISH_GONE_HOME), "--mode", "full", "--copy"],
+                     home=POLISH_GONE_HOME)
+check("--mode full with the polish enabled but the CLI missing exits 5",
+      _full_gone.returncode, p.EXIT_POLISH_FALLBACK)
+check("still no marker, because the CLI was never invoked",
+      p.PHASE_POLISHING in _full_gone.stdout, False)
+check("the words reach the clipboard there too",
+      open(CLIPBOARD).read(), "words the missing CLI could not polish")
+
+# The same for a claude_bin that exists but cannot be executed: it used to raise
+# PermissionError out of subprocess.run, which on the automatic paths lost the dictation.
+_unrunnable = os.path.join(FAKE_BIN, "unrunnable-claude")
+with open(_unrunnable, "w") as _fh:
+    _fh.write("#!/bin/sh\nexit 0\n")
+os.chmod(_unrunnable, 0o644)
+POLISH_UNRUNNABLE_HOME = polish_home(_unrunnable, "scribe-test-polish-unrunnable-")
+StubWhisper.text = "words a broken CLI must not swallow"
+_full_unrunnable = run_cli([recorded_wav(POLISH_UNRUNNABLE_HOME), "--mode", "full", "--copy"],
+                           home=POLISH_UNRUNNABLE_HOME)
+check("a claude_bin that cannot be executed exits 5, not 1",
+      _full_unrunnable.returncode, p.EXIT_POLISH_FALLBACK)
+check("the words survive an unrunnable CLI",
+      open(CLIPBOARD).read(), "words a broken CLI must not swallow")
+
+# ...and if it somehow gets past that check (replaced between the check and the exec), the
+# OSError is still a fallback rather than a crash.
+_saved_oserror_run = p.subprocess.run
+
+
+def _explode_run(*_args, **_kwargs):
+    raise PermissionError(13, "Permission denied")
+
+
+p.subprocess.run = _explode_run
+_boom, _boom_out, _boom_err = polish_capturing(p.polish_with_status, "keep my words",
+                                               _polish_cfg)
+p.subprocess.run = _saved_oserror_run
+check("an OSError from the polish CLI falls back instead of raising",
+      _boom, ("keep my words", False))
+check("the OSError fallback says why on stderr",
+      "could not run the claude CLI" in _boom_err, True)
+
+StubWhisper.text = "an instant dictation"
+_dict_run = run_cli([recorded_wav(POLISH_OK_HOME), "--mode", "dict", "--copy"],
+                    home=POLISH_OK_HOME)
+check("dict mode exits 0 and never polishes",
+      (_dict_run.returncode, p.PHASE_POLISHING in _dict_run.stdout), (0, False))
+check("dict mode pastes the transcription itself",
+      open(CLIPBOARD).read(), "an instant dictation")
+
+# --polish-last keeps its contract exactly: exit 0 whether or not the polish could run. Its
+# caller pastes only on exit 0, so reporting a fallback there would paste nothing at all.
+_pl_ok = run_cli(["--polish-last", "--copy"], home=POLISH_OK_HOME)
+check("--polish-last exits 0", _pl_ok.returncode, 0)
+check("--polish-last polishes the last instant dictation", open(CLIPBOARD).read(), POLISHED)
+check("--polish-last announces the polish on stdout too",
+      p.PHASE_POLISHING in _pl_ok.stdout, True)
+_pl_fb = run_cli(["--polish-last", "--copy"], home=POLISH_FAIL_HOME)
+check("--polish-last still exits 0 when the polish falls back", _pl_fb.returncode, 0)
+check("--polish-last leaves the unpolished words on the clipboard",
+      open(CLIPBOARD).read(), "words that must survive a failed polish")
+
+# Precedence: the optimizer wins, so a configured mode=full is downgraded rather than run first.
+OPT_WINS_HOME = polish_home(_opt_claude, "scribe-test-opt-wins-", mode="full")
+StubWhisper.text = "so I want the parser to take both formats"
+_wins = run_cli([recorded_wav(OPT_WINS_HOME), "--optimize-for", "opus", "--copy"],
+                home=OPT_WINS_HOME)
+check("--optimize-for beats a configured mode=full", _wins.returncode, 0)
+check("the optimizer ran", p.PHASE_OPTIMIZING in _wins.stdout, True)
+check("the polish did not", p.PHASE_POLISHING in _wins.stdout, False)
+check("the skipped polish is logged",
+      "polish skipped: --optimize-for wins" in cli_state("scribe.log", OPT_WINS_HOME), True)
+
+check("exit 5 is distinct from every other exit code",
+      (p.EXIT_POLISH_FALLBACK, p.EXIT_OPTIMIZER_FALLBACK, p.EXIT_EMPTY, p.EXIT_FAIL),
+      (5, 4, 3, 1))
 
 
 fails = [c for c in cases if not c[1]]

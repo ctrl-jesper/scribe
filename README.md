@@ -105,6 +105,13 @@ Other actions:
 - **Polish the last dictation** - `⌘⌥⌃P`, shown only if you enabled polish in setup. Runs the
   AI cleanup pass on the dictation you just made, about 10 seconds, without re-recording. Tip:
   undo the instant paste first, so the polished version replaces it rather than duplicating it.
+- **Auto-polish** - a checkbox in the menu-bar dropdown, off by default, shown only when the
+  AI polish is configured. Runs the polish pass automatically at the end of every dictation
+  instead of waiting for the hotkey, so the text that lands is already cleaned up. It adds
+  roughly ten seconds to every dictation, which is why it is a switch rather than the default:
+  excellent for composing prose, tiresome for one-line instructions. If a prompt-mode target
+  is armed, that takes precedence and auto-polish is skipped, since the rewrite already cleans
+  the text; the menu says so rather than ignoring the setting silently.
 - **Prompt mode** - a radio group in the menu-bar dropdown, off by default. For stream-of-
   thought dictations meant as instructions to an AI coding assistant: instead of pasting the
   raw transcription, Scribe first has a fast Claude model rewrite it into a tight, structured
@@ -237,6 +244,10 @@ Nothing is sent anywhere by default.
 prompt mode, the *text* of a dictation (never the audio) is sent to Anthropic's Claude
 through your own, locally installed Claude CLI, under your own account and subject to its
 own terms. Both are off by default and only run when you invoke them.
+
+**The principle behind all of this.** Audio never leaves the machine. That is the structural
+difference between Scribe and cloud dictation tools, and it is not tradeable for accuracy or
+convenience. See [ROADMAP.md](ROADMAP.md) for what that rules in and out.
 
 **Other network traffic.** A one-time model download from Hugging Face at install time, and
 Homebrew package installs. No telemetry, no analytics, no accounts, no update phone-home.

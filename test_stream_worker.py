@@ -570,13 +570,14 @@ class FinishedSession:
         self.cuts = []
 
 
-def finish_capturing(texts, optimize_for=None, cfg=None, copy=False):
+def finish_capturing(texts, optimize_for=None, cfg=None, copy=False, polish=False):
     """Run _finish over stubbed chunks. Returns (exit code, worker stdout, worker stderr)."""
     saved_out, saved_err = sys.stdout, sys.stderr
     sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
     try:
         code = sw._finish(FinishedSession(len(texts)), DoneTranscriber(texts), cfg or CFG,
-                          copy, False, time.time(), {}, optimize_for=optimize_for)
+                          copy, False, time.time(), {}, optimize_for=optimize_for,
+                          polish=polish)
         return code, sys.stdout.getvalue(), sys.stderr.getvalue()
     finally:
         sys.stdout, sys.stderr = saved_out, saved_err
@@ -670,13 +671,117 @@ check("a missing claude CLI is a fallback, not a crash", _gone_code, sw.EXIT_OPT
 check("no marker is printed when the CLI is never invoked", _gone_out, "keep my words\n")
 
 
+# --- 6c2. auto-polish: the same finish path, the same fail-safe, its own marker and code ------
+# The polish itself is pipeline's, and pipeline's own tests cover its prompt and isolation.
+# What matters here is the worker's half: the merged text is what gets polished, the POLISHING
+# marker lands on the worker's own stdout, the polished text is what is emitted and copied, a
+# polish that could not run still emits the words and returns 5, and --optimize-for wins.
+_polish_claude = write_script("polish-claude",
+                              'cat > /dev/null\nprintf "the cleaned dictation\\n"\n')
+_polish_failing = write_script("polish-failing", "cat > /dev/null\nexit 1\n")
+POLISH_CFG = dict(CFG, polish_enabled=True, claude_bin=_polish_claude,
+                  claude_model="claude-haiku-4-5-20251001")
+
+_ap_code, _ap_out, _ap_err = finish_capturing(["  so the raw  ", "dictation"], polish=True,
+                                              cfg=POLISH_CFG)
+check("auto-polish exits 0 when the polish runs", _ap_code, 0)
+check("the worker prints the POLISHING marker on its own stdout, first",
+      _ap_out.splitlines()[0], p.PHASE_POLISHING)
+check("the polished text follows the marker on the same stdout",
+      "\n".join(_ap_out.splitlines()[1:]), "the cleaned dictation")
+
+_copied[:] = []
+sw.pipeline.copy_to_clipboard = lambda text: (_copied.append(text), True)[1]
+_ap_copy_code, _ap_copy_out, _ = finish_capturing(["the raw dictation"], polish=True,
+                                                  cfg=POLISH_CFG, copy=True)
+check("the polished text is what reaches the clipboard",
+      (_ap_copy_code, _copied), (0, ["the cleaned dictation"]))
+
+_copied[:] = []
+_ap_fb_code, _ap_fb_out, _ap_fb_err = finish_capturing(
+    ["keep my words"], polish=True, copy=True, cfg=dict(POLISH_CFG, claude_bin=_polish_failing))
+check("a failed polish returns the polish fallback exit code",
+      _ap_fb_code, sw.EXIT_POLISH_FALLBACK)
+check("the worker and pipeline agree on the polish fallback code",
+      (sw.EXIT_POLISH_FALLBACK, p.EXIT_POLISH_FALLBACK), (5, 5))
+check("a failed polish still emits the unpolished transcription",
+      "\n".join(_ap_fb_out.splitlines()[1:]), "keep my words")
+check("the marker was still printed before that failed polish call",
+      _ap_fb_out.splitlines()[0], p.PHASE_POLISHING)
+check("a failed polish still copies the unpolished transcription", _copied, ["keep my words"])
+
+# A polish switched off in config is a setting, not a failure: exit 0, the way a run without
+# --polish would. Exiting 5 there would make dictate.lua alert after every dictation.
+_copied[:] = []
+_ap_off_code, _ap_off_out, _ap_off_err = finish_capturing(
+    ["keep my words"], polish=True, copy=True, cfg=dict(POLISH_CFG, polish_enabled=False))
+check("a polish switched off in config exits 0", _ap_off_code, 0)
+check("no POLISHING marker when the polish CLI is never invoked",
+      _ap_off_out, "keep my words\n")
+check("the blocked polish says why on stderr", "[polish skipped]" in _ap_off_err, True)
+check("the words are still copied when the polish is blocked", _copied, ["keep my words"])
+
+# Enabled but unavailable IS a fallback: the user asked for a polish and did not get one.
+_ap_gone_code, _ap_gone_out, _ = finish_capturing(
+    ["keep my words"], polish=True,
+    cfg=dict(POLISH_CFG, claude_bin=os.path.join(FAKE_BIN, "no-such-claude")))
+check("a missing claude CLI is a polish fallback, not a crash",
+      (_ap_gone_code, _ap_gone_out), (sw.EXIT_POLISH_FALLBACK, "keep my words\n"))
+
+# A claude_bin that exists but cannot be executed used to raise PermissionError out of
+# subprocess.run. In streaming nothing is persisted until after the polish, so that did not
+# just skip the cleanup, it lost the dictation: no clipboard, no last-output.txt, no
+# last-dict.txt. It must degrade to the same fallback as a missing CLI.
+_unrunnable_claude = write_script("unrunnable-claude", "exit 0\n")
+os.chmod(_unrunnable_claude, 0o644)
+_copied[:] = []
+sw.pipeline.copy_to_clipboard = lambda text: (_copied.append(text), True)[1]
+_ap_unrunnable_code, _ap_unrunnable_out, _ = finish_capturing(
+    ["keep my words"], polish=True, copy=True,
+    cfg=dict(POLISH_CFG, claude_bin=_unrunnable_claude))
+check("a claude_bin that cannot be executed is a fallback, not a crash",
+      (_ap_unrunnable_code, _ap_unrunnable_out), (sw.EXIT_POLISH_FALLBACK, "keep my words\n"))
+check("the dictation still reaches the clipboard when the CLI cannot be executed",
+      _copied, ["keep my words"])
+
+# Precedence: both flags given -> the optimizer runs and the polish is skipped entirely.
+_saved_optimize_again = sw.pipeline.optimize_prompt
+_precedence_calls = []
+
+
+def _spy_optimize(text, cfg, target):
+    _precedence_calls.append((text, target))
+    return REWRITE
+
+
+sw.pipeline.optimize_prompt = _spy_optimize
+_both_code, _both_out, _both_err = finish_capturing(["  the parser  ", "takes both formats"],
+                                                    optimize_for="opus", polish=True,
+                                                    cfg=POLISH_CFG)
+sw.pipeline.optimize_prompt = _saved_optimize_again
+check("with both flags the optimizer still runs, on the merged text",
+      _precedence_calls, [("the parser takes both formats", "opus")])
+check("with both flags the polish is skipped: no POLISHING marker",
+      p.PHASE_POLISHING in _both_out, False)
+check("with both flags the rewrite is what gets emitted", (_both_code, _both_out),
+      (0, REWRITE + "\n"))
+
+# A stale clipboard outranks the polish fallback too: the caller must not paste at all.
+sw.pipeline.copy_to_clipboard = lambda text: False
+_ap_stale_code, _, _ = finish_capturing(["keep my words"], polish=True, copy=True,
+                                        cfg=dict(POLISH_CFG, claude_bin=_polish_failing))
+check("a failed clipboard copy wins over the polish fallback code too",
+      _ap_stale_code, sw.EXIT_FAIL)
+sw.pipeline.copy_to_clipboard = _saved_copy
+
+
 # --- 6d. prompt mode: the flag plumbs from the command line into both run modes -------------
 def plumbed_optimize_for(argv, attr):
     """Replace run_file/run_live with a spy, run main(argv), return what it was handed."""
     seen = {}
 
-    def spy(source, cfg, copy=False, timings=False, optimize_for=None):
-        seen["source"], seen["optimize_for"] = source, optimize_for
+    def spy(source, cfg, copy=False, timings=False, optimize_for=None, polish=False):
+        seen["source"], seen["optimize_for"], seen["polish"] = source, optimize_for, polish
         return 0
 
     saved = getattr(sw, attr)
@@ -699,6 +804,19 @@ check("--optimize-for reaches live mode", _live_plumb["optimize_for"], "fable")
 check("live mode still gets its microphone index", _live_plumb["source"], "3")
 check("omitting --optimize-for leaves the rewrite off",
       plumbed_optimize_for(["--from-file", _HDR_WAV], "run_file")["optimize_for"], None)
+
+# --polish plumbs the same way, and the two flags may be given together: the worker applies the
+# precedence itself rather than making argparse refuse the combination.
+check("--polish reaches file mode",
+      plumbed_optimize_for(["--from-file", _HDR_WAV, "--polish"], "run_file")["polish"], True)
+check("--polish reaches live mode",
+      plumbed_optimize_for(["--mic", "3", "--polish"], "run_live")["polish"], True)
+check("omitting --polish leaves auto-polish off",
+      plumbed_optimize_for(["--from-file", _HDR_WAV], "run_file")["polish"], False)
+_both_flags = plumbed_optimize_for(
+    ["--from-file", _HDR_WAV, "--polish", "--optimize-for", "fable"], "run_file")
+check("both flags together are accepted and both reach the run",
+      (_both_flags["polish"], _both_flags["optimize_for"]), (True, "fable"))
 
 _stderr, sys.stderr = sys.stderr, io.StringIO()
 check_raises("an unknown --optimize-for target is refused", SystemExit,

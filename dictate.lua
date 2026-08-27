@@ -129,6 +129,12 @@ end
 
 scribe.promptTarget = normalizePromptTarget(hs.settings.get("scribe.promptTarget"))
 
+-- Auto-polish: when armed, every dictation runs the LLM cleanup (the same pass the polish
+-- hotkey applies after the fact) before the text is pasted, in both batch and streaming mode.
+-- Persisted like the toggles above, off by default. Compared against true rather than read
+-- straight, so a hand-edited plist or an older build cannot leave it holding a non-boolean.
+scribe.autoPolish = hs.settings.get("scribe.autoPolish") == true
+
 local function log(message)
     print("[Scribe] " .. message)
 end
@@ -740,9 +746,11 @@ local function finishTranscription()
     setMenuIdle()
 end
 
--- The Python side prints a flushed OPTIMIZING line when the prompt rewrite begins (pipeline
--- stdout in batch, worker stdout in streaming). Swap the typing bounce for the orbit; the menu
--- bar keeps its existing transcribing state, which already reads as "working".
+-- The Python side prints a flushed phase line when an LLM pass begins (pipeline stdout in
+-- batch, worker stdout in streaming): OPTIMIZING for the prompt rewrite, POLISHING for the
+-- auto-polish. They mean the same thing to the user, an AI pass is running and it takes about
+-- ten seconds, so both drive this one state and this one animation. Swap the typing bounce for
+-- the orbit; the menu bar keeps its existing transcribing state, which already reads as "working".
 -- Guarded twice: once so a marker arriving while the mic is still open cannot fight the level
 -- bars for the same frames, and once so a repeated marker does not restart the orbit mid-turn.
 local function enterOptimizing()
@@ -773,11 +781,16 @@ local function transcribeAndPaste()
     --   --consume         deletes the WAV once it has been read, so it cannot be reused.
     local args = { PIPELINE, WAV, "--copy", "--consume",
                    "--not-older-than", string.format("%d", scribe.sessionStart or 0) }
-    -- The LATCHED target, so a menu change made during transcription cannot redirect the run
-    -- that is already under way.
+    -- The LATCHED target and the LATCHED auto-polish, so a menu change made during
+    -- transcription cannot redirect the run that is already under way. The two are mutually
+    -- exclusive by construction (see the latch in startRecording): pipeline.py refuses
+    -- --mode full together with --optimize-for.
     if scribe.activePromptTarget and scribe.activePromptTarget ~= "off" then
         args[#args + 1] = "--optimize-for"
         args[#args + 1] = scribe.activePromptTarget
+    elseif scribe.activeAutoPolish then
+        args[#args + 1] = "--mode"
+        args[#args + 1] = "full"
     end
     scribe.pipeTask = hs.task.new(PYTHON, function(exitCode, _, stderr)
         finishTranscription()
@@ -789,6 +802,11 @@ local function transcribeAndPaste()
             hs.eventtap.keyStroke({ "cmd" }, "v")
             alertProblem("prompt optimizer unavailable, pasted the raw transcription", 2.5)
             log("pipeline stderr: " .. (stderr or ""))
+        elseif exitCode == 5 then
+            -- Same contract as 4, for the auto-polish: pasted-ready, but unpolished.
+            hs.eventtap.keyStroke({ "cmd" }, "v")
+            alertProblem("polish unavailable, pasted the unpolished transcription", 2.5)
+            log("pipeline stderr: " .. (stderr or ""))
         elseif exitCode == 3 then
             return                                                -- nothing was said: reset quietly
         else
@@ -796,8 +814,10 @@ local function transcribeAndPaste()
             log("pipeline error: " .. (stderr or ""))
         end
     end,
-    function(_, stdOut, _)                                        -- stream callback: the phase marker
-        if stdOut and stdOut:find("OPTIMIZING") then enterOptimizing() end
+    function(_, stdOut, _)                                        -- stream callback: the phase markers
+        if stdOut and (stdOut:find("OPTIMIZING") or stdOut:find("POLISHING")) then
+            enterOptimizing()
+        end
         return true
     end,
     args)
@@ -879,6 +899,11 @@ local function streamWorkerFinished(exitCode, _, stderr)
         hs.eventtap.keyStroke({ "cmd" }, "v")
         alertProblem("prompt optimizer unavailable, pasted the raw transcription", 2.5)
         log("stream worker stderr: " .. (stderr or ""))
+    elseif exitCode == 5 then
+        -- Same again for the auto-polish: the words are on the clipboard, unpolished.
+        hs.eventtap.keyStroke({ "cmd" }, "v")
+        alertProblem("polish unavailable, pasted the unpolished transcription", 2.5)
+        log("stream worker stderr: " .. (stderr or ""))
     elseif exitCode == 3 then
         return                                                     -- empty/aborted dictation: reset quietly
     else
@@ -905,6 +930,13 @@ local function startRecording()
     -- Same latch for the prompt-mode target, for the same reason: the badge, the argv and the
     -- OPTIMIZING phase all have to agree with each other for the whole of THIS dictation.
     scribe.activePromptTarget = scribe.promptTarget
+    -- And for auto-polish. Both gates from the menu are repeated here rather than trusted,
+    -- because the persisted setting outlives them: POLISH_ENABLED, so a config with the polish
+    -- switched off does not ask for a pass that can only fail, and the prompt-mode precedence,
+    -- so a target armed after auto-polish was switched on cannot put both flags on one command
+    -- line (pipeline.py refuses --mode full with --optimize-for outright).
+    scribe.activeAutoPolish = POLISH_ENABLED and scribe.autoPolish
+        and scribe.activePromptTarget == "off"
     scribe.optimizing = false
     if scribe.activeStreaming and not PYTHON then
         alertProblem("python3 not found, run install.sh again", 4)
@@ -931,12 +963,16 @@ local function startRecording()
         if scribe.activePromptTarget ~= "off" then
             workerArgs[#workerArgs + 1] = "--optimize-for"
             workerArgs[#workerArgs + 1] = scribe.activePromptTarget
+        elseif scribe.activeAutoPolish then
+            workerArgs[#workerArgs + 1] = "--polish"
         end
         scribe.recTask = hs.task.new(PYTHON, streamWorkerFinished,
             function(_, stdOut, _)                                 -- stream callback: cue, levels, phase
                 if stdOut then
                     if stdOut:find("MIC_READY") then cueSpeak() end
-                    if stdOut:find("OPTIMIZING") then enterOptimizing() end
+                    if stdOut:find("OPTIMIZING") or stdOut:find("POLISHING") then
+                        enterOptimizing()
+                    end
                     feedWorkerChunk(stdOut)                        -- "LEVEL <band> <dB>" -> HUD bars
                 end
                 return true
@@ -1071,6 +1107,23 @@ local function buildMenu()
     local items = {}
     if POLISH_ENABLED then
         items[#items + 1] = { title = "Polish last dictation   (⌘⌥⌃P)", fn = doPolish }
+        -- Auto-polish only exists where the polish itself does, so it lives inside the same
+        -- gate. While a prompt target is armed the optimizer wins and this setting does
+        -- nothing, so the item says that outright rather than showing a checkmark that would
+        -- quietly have no effect.
+        if scribe.promptTarget ~= "off" then
+            items[#items + 1] = { title = "Auto-polish (overridden by prompt mode)",
+                                  disabled = true }
+        else
+            items[#items + 1] = { title = "Auto-polish every dictation",
+                checked = scribe.autoPolish,
+                fn = function()
+                    scribe.autoPolish = not scribe.autoPolish
+                    hs.settings.set("scribe.autoPolish", scribe.autoPolish)
+                    buildMenu()
+                    hs.alert.show(scribe.autoPolish and "Auto-polish ON" or "Auto-polish OFF", 1)
+                end }
+        end
     end
     items[#items + 1] = { title = "Recall last dictation   (⌘⌥⌃L)", fn = doRecall }
     items[#items + 1] = { title = "Streaming mode (beta)", checked = scribe.streaming, fn = function()

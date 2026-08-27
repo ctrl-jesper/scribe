@@ -2,6 +2,26 @@
 
 All notable changes to Scribe are documented in this file.
 
+## [0.4.0] - 2026-08-26
+
+### Added
+
+- Auto-polish: run the AI cleanup pass automatically at the end of every dictation instead of
+  pressing the hotkey afterwards. A checkbox in the menu, off by default, available in both
+  batch and streaming modes. If prompt mode is armed it takes precedence and the polish is
+  skipped, since the rewrite already cleans the text; the menu shows this rather than
+  ignoring the setting.
+- ROADMAP.md: what the project plans to build, what it will not, and the principle that
+  audio never leaves the machine.
+
+### Fixed
+
+- A Claude CLI path that exists but is not executable could lose a streaming dictation
+  entirely (no clipboard, no state file). It now falls back to the unpolished words like any
+  other polish failure.
+- A configuration with polish switched off but the mode set to full no longer reports a
+  failure on every dictation; a disabled polish is a setting, not an error.
+
 ## [0.3.0] - 2026-08-26
 
 ### Added

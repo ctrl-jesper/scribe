@@ -52,11 +52,27 @@ Exit codes:
        exit, timeout, empty answer). The text on stdout and on the clipboard is the RAW
        cleaned transcription, not an optimized prompt. The caller should still paste it:
        the words are never lost, they are simply not rewritten.
+    5  --mode full asked for the LLM polish, the polish was enabled, and it still could not
+       run (CLI missing or not executable, nonzero exit, timeout, empty answer). The text on
+       stdout and on the clipboard is the UNPOLISHED transcription. Same contract as 4: paste
+       it anyway, the words are there, they are simply not cleaned up.
+       Two deliberate exceptions, both of which keep exiting 0: --mode full with
+       "polish_enabled": false, which is a setting rather than a failure and has always been
+       silent, and --polish-last, whose caller pastes only on exit 0, so reporting a fallback
+       there would paste nothing at all.
 
 Phase markers on stdout:
     OPTIMIZING  printed on its own line immediately before the optimizer CLI is invoked, so
                 the caller can switch its progress indicator. It is never printed when the
                 optimizer is not actually invoked.
+    POLISHING   the same thing for the polish CLI: printed immediately before it is invoked
+                and never when the polish is skipped or blocked. Both markers mean the same
+                thing to the caller (an LLM pass is running, expect ~10s).
+
+Precedence: --optimize-for wins over the polish pass. The rewrite already cleans the text,
+so polishing first would spend a second LLM call on words the rewrite is about to replace.
+argparse refuses --optimize-for with --mode full outright, and a config.json "mode": "full"
+is downgraded to dict (with a log line) when --optimize-for is given.
 
 Configuration lives in ~/.config/scribe/ (config.json, dictionary.json, state/).
 Set the SCRIBE_HOME environment variable to point that somewhere else, which is how the
@@ -72,12 +88,15 @@ DEFAULT_SCRIBE_HOME = "~/.config/scribe"
 EXIT_FAIL = 1
 EXIT_EMPTY = 3                      # same meaning as stream_worker.py's EXIT_EMPTY
 EXIT_OPTIMIZER_FALLBACK = 4         # same meaning as stream_worker.py's EXIT_OPTIMIZER_FALLBACK
+EXIT_POLISH_FALLBACK = 5            # same meaning as stream_worker.py's EXIT_POLISH_FALLBACK
 
 DEFAULT_MAX_AGE_S = 3600.0          # see the session-provenance note above
 
 OPTIMIZE_TARGETS = ("fable", "opus", "sonnet")   # models a dictated prompt can be aimed at
 PHASE_OPTIMIZING = "OPTIMIZING"     # stdout phase marker; the caller watches for it
+PHASE_POLISHING = "POLISHING"       # the same marker mechanism for the polish pass
 OPTIMIZER_TIMEOUT_S = 120.0         # same budget as the polish pass
+POLISH_TIMEOUT_S = 120.0            # how long `claude -p` may take to clean one dictation
 
 # Every value the tool needs if config.json is missing a key (or missing entirely).
 DEFAULTS = {
@@ -652,12 +671,21 @@ def collapse_repetitions(text):
 # --------------------------------------------------------------------------------------
 
 def polish_blocked_reason(cfg):
-    """Why the optional LLM polish cannot run right now, or None if it can."""
+    """Why the optional LLM polish cannot run right now, or None if it can.
+
+    Executability is checked, not just existence: a claude_bin that exists but cannot be run
+    (wrong permissions, a directory, a stale wrapper) would otherwise raise OSError out of
+    subprocess.run. On the automatic paths that is the difference between "pasted unpolished"
+    and losing the dictation, because streaming persists nothing until after the polish.
+    """
     if not cfg.get("polish_enabled"):
         return "polish is disabled; set \"polish_enabled\": true in %s" % CONFIG_PATH
     claude_bin = os.path.expanduser(cfg["claude_bin"])
     if not os.path.exists(claude_bin):
         return "claude CLI not found at %s; set \"claude_bin\" in %s" % (claude_bin, CONFIG_PATH)
+    if not os.access(claude_bin, os.X_OK):
+        return ("claude CLI at %s is not executable; fix its permissions or set \"claude_bin\" "
+                "in %s" % (claude_bin, CONFIG_PATH))
     return None
 
 
@@ -677,10 +705,28 @@ def polish_argv(cfg):
 
 
 def llm_polish(text, cfg):
-    """Run the cleanup through `claude -p`, isolated for low startup latency.
+    """Run the cleanup through `claude -p` and return the cleaned text.
+
+    Fails safe: when the CLI cannot run, fails, times out or answers with nothing, the
+    UNPOLISHED input comes back instead. That is deliberate, and unchanged; a caller that
+    needs to tell "cleaned" from "fell back" apart calls polish_with_status() instead.
+    """
+    return polish_with_status(text, cfg)[0]
+
+
+def polish_with_status(text, cfg):
+    """Polish `text`, and say whether the polish actually happened.
+
+    Returns (text, polished). `polished` is False when the CLI failed, timed out or answered
+    with nothing, in which case the returned text is the unpolished input: the user's words
+    are never lost, so the exit code is the only thing that can tell the caller they were not
+    cleaned (EXIT_POLISH_FALLBACK).
 
     Runs in an empty temporary directory OUTSIDE $HOME: the old cwd was inside the Scribe
     config directory, so the CLI's upward CLAUDE.md search still reached ~/CLAUDE.md.
+
+    The caller must have checked polish_blocked_reason() first. This function assumes the CLI
+    is there and prints the POLISHING marker on the way to running it.
     """
     empty_cwd = tempfile.mkdtemp(prefix="scribe-polish-")
     prompt = build_polish_input(text, cfg)
@@ -689,13 +735,23 @@ def llm_polish(text, cfg):
     # them is a no-op there and makes this robust if ever run from inside a Claude Code shell.
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("CLAUDE", "ANTHROPIC", "AI_AGENT"))}
+    print_phase_marker(PHASE_POLISHING)   # last thing before the CLI starts, never after a failure
     try:
         proc = subprocess.run(polish_argv(cfg), input=prompt, capture_output=True, text=True,
-                              cwd=empty_cwd, env=env, timeout=120)
+                              cwd=empty_cwd, env=env, timeout=POLISH_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        log("polish fallback: claude -p timed out after 120s")
-        sys.stderr.write("[llm_polish fallback] claude -p timed out after 120s\n")
-        return text
+        log("polish fallback: claude -p timed out after %.0fs" % POLISH_TIMEOUT_S)
+        sys.stderr.write("[llm_polish fallback] claude -p timed out after %.0fs\n"
+                         % POLISH_TIMEOUT_S)
+        return text, False
+    except OSError as exc:
+        # The CLI passed polish_blocked_reason a moment ago but still could not be executed
+        # (replaced, unmounted, a bad interpreter line). Falling back keeps the dictation;
+        # letting OSError escape would lose it, because the streaming path persists nothing
+        # until this returns.
+        log("polish fallback: could not run %s: %s" % (cfg["claude_bin"], exc))
+        sys.stderr.write("[llm_polish fallback] could not run the claude CLI: %s\n" % exc)
+        return text, False
     finally:
         shutil.rmtree(empty_cwd, ignore_errors=True)
     result = proc.stdout.strip()
@@ -706,12 +762,15 @@ def llm_polish(text, cfg):
             % (proc.returncode, result[:200], proc.stderr.strip()[:200]))
         sys.stderr.write(f"[llm_polish fallback] rc={proc.returncode} "
                          f"out={result[:200]} err={proc.stderr.strip()[:200]}\n")
-        return text
+        return text, False
     cleaned = re.sub(r"<think>.*?</think>", "", result, flags=re.DOTALL).strip()
     # The polished text is the only text that never passed through the collapser, and the LLM
     # may answer in several lines. Collapsing here keeps the clipboard single-line on every path.
     polished = collapse_repetitions(cleaned)
-    return polished if polished else text
+    if not polished:
+        log("polish fallback: nothing left after collapsing %r" % cleaned[:200])
+        return text, False
+    return polished, True
 
 
 # --------------------------------------------------------------------------------------
@@ -827,8 +886,14 @@ def optimize_prompt(text, cfg, target):
 # --------------------------------------------------------------------------------------
 
 def run(wav_path, mode, cfg, timings=False, max_age=DEFAULT_MAX_AGE_S,
-        not_older_than=None, consume=False):
-    """Transcribe one file. Returns "" when nothing was said (the caller then exits 3)."""
+        not_older_than=None, consume=False, status=None):
+    """Transcribe one file. Returns "" when nothing was said (the caller then exits 3).
+
+    `status`, when a dict is passed, is filled in with what the return value cannot carry:
+    status["polish_fallback"] becomes True if mode == "full" asked for a polish that could not
+    run. The text itself is returned on every path either way, so a caller that does not care
+    (the streaming tests, an interactive run) can ignore it entirely.
+    """
     check_audio_freshness(wav_path, max_age=max_age, not_older_than=not_older_than)
     t = {}
     t0 = time.time()
@@ -850,16 +915,30 @@ def run(wav_path, mode, cfg, timings=False, max_age=DEFAULT_MAX_AGE_S,
         if blocked:
             log("polish skipped: %s" % blocked)
             sys.stderr.write("[polish skipped] %s\n" % blocked)
+            # A polish switched OFF in config is a setting, not a failure: a hand-edited
+            # "mode": "full" with "polish_enabled": false has always exited 0 quietly and
+            # still does, rather than nagging on every dictation forever. A polish that is
+            # ON but unavailable is a fallback the user does need to hear about.
+            if status is not None and cfg.get("polish_enabled"):
+                status["polish_fallback"] = True
         else:
             t2 = time.time()
-            text = llm_polish(text, cfg); t["llm"] = time.time() - t2
+            text, polished = polish_with_status(text, cfg); t["llm"] = time.time() - t2
+            if not polished and status is not None:
+                status["polish_fallback"] = True
     if timings:
         sys.stderr.write("timings: " + ", ".join(f"{k}={v:.2f}s" for k, v in t.items()) + "\n")
     return text
 
 
 def polish_last(cfg):
-    """Run the LLM polish on the last instant dictation (no re-recording)."""
+    """Run the LLM polish on the last instant dictation (no re-recording).
+
+    Always returns text and the caller always exits 0, including when the polish could not
+    run: this path is invoked by hand on words that are already pasted, and its caller pastes
+    only on exit 0. Reporting a fallback here would mean pasting nothing at all, which is why
+    EXIT_POLISH_FALLBACK belongs to the dictation paths and not to this one.
+    """
     if not os.path.exists(LAST_PATH):
         raise RuntimeError("no previous dictation to polish (expected %s)" % LAST_PATH)
     text = open(LAST_PATH).read().strip()
@@ -890,7 +969,10 @@ def copy_to_clipboard(text):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("wav", nargs="?", help="audio file to dictate; omit with --polish-last")
-    ap.add_argument("--mode", choices=["dict", "full"])
+    ap.add_argument("--mode", choices=["dict", "full"],
+                    help="dict = transcribe + dictionary only; full = also run the LLM polish "
+                         "(auto-polish), which exits %d if the polish is unavailable"
+                         % EXIT_POLISH_FALLBACK)
     ap.add_argument("--polish-last", action="store_true",
                     help="LLM-polish the previous instant dictation instead of recording")
     ap.add_argument("--copy", action="store_true", help="also copy result to clipboard")
@@ -907,7 +989,9 @@ if __name__ == "__main__":
                          "when it is the recorder's own state/dictation.wav")
     ap.add_argument("--optimize-for", choices=list(OPTIMIZE_TARGETS), dest="optimize_for",
                     help="rewrite the dictation into a prompt aimed at this model instead of "
-                         "pasting the transcript; exits %d if the rewrite is unavailable"
+                         "pasting the transcript; exits %d if the rewrite is unavailable. "
+                         "Wins over the polish pass: --mode full is refused with it, and a "
+                         'config "mode": "full" is downgraded to dict'
                          % EXIT_OPTIMIZER_FALLBACK)
     args = ap.parse_args()
     if args.optimize_for and args.mode == "full":
@@ -920,6 +1004,7 @@ if __name__ == "__main__":
                  "fresh dictation, not the previous instant result")
     started = time.time()
     mode = "polish-last" if args.polish_last else (args.mode or "?")
+    status = {}
     try:
         cfg = load_config()
         if args.polish_last:
@@ -931,11 +1016,16 @@ if __name__ == "__main__":
             # Prompt mode pins the mode to dict; config.json's "mode" must not turn it into
             # a polish run behind the user's back.
             mode = "dict" if args.optimize_for else (args.mode or cfg["mode"])
+            if args.optimize_for and cfg["mode"] == "full":
+                # The optimizer wins, here as everywhere: it rewrites and cleans the text
+                # itself, so a polish pass first would spend ~10s on words it replaces.
+                log("polish skipped: --optimize-for wins over the configured mode=full")
             log("start mode=%s file=%s%s"
                 % (mode, args.wav,
                    (" optimize-for=%s" % args.optimize_for) if args.optimize_for else ""))
             result = run(args.wav, mode, cfg, timings=args.timings, max_age=args.max_age,
-                         not_older_than=args.not_older_than, consume=args.consume)
+                         not_older_than=args.not_older_than, consume=args.consume,
+                         status=status)
     except RuntimeError as exc:
         log("FAIL mode=%s %.2fs: %s" % (mode, time.time() - started, exc))
         sys.stderr.write("scribe: %s\n" % exc)
@@ -955,11 +1045,16 @@ if __name__ == "__main__":
             # The unoptimized transcript is still what gets copied and printed below; the
             # exit code is the only thing that tells the caller it was not rewritten.
             exit_code = EXIT_OPTIMIZER_FALLBACK
+    elif status.get("polish_fallback"):
+        # Same shape: the unpolished transcript is copied and printed below either way.
+        exit_code = EXIT_POLISH_FALLBACK
     write_state(OUTPUT_PATH, result)   # persist for the recall hotkey
     if args.copy and not copy_to_clipboard(result):
         raise SystemExit(EXIT_FAIL)
     print(result)
-    log("%s mode=%s %.2fs %d chars"
-        % ("OPTIMIZER-FALLBACK" if exit_code else "OK", mode, time.time() - started, len(result)))
+    outcome = {0: "OK",
+               EXIT_OPTIMIZER_FALLBACK: "OPTIMIZER-FALLBACK",
+               EXIT_POLISH_FALLBACK: "POLISH-FALLBACK"}[exit_code]
+    log("%s mode=%s %.2fs %d chars" % (outcome, mode, time.time() - started, len(result)))
     if exit_code:
         raise SystemExit(exit_code)

@@ -3,9 +3,9 @@
 still talking, and finish fast on key release.
 
 Usage:
-    stream_worker.py --mic INDEX [--language en] [--copy] [--timings]
+    stream_worker.py --mic INDEX [--language en] [--copy] [--timings] [--polish]
                      [--optimize-for fable|opus|sonnet]
-    stream_worker.py --from-file PATH [--language en] [--copy] [--timings]  # same logic, no microphone
+    stream_worker.py --from-file PATH [--language en] [--copy] [--timings] [--polish]  # no microphone
 
 Architecture: "rolling handoff, never force-cut".
 
@@ -32,10 +32,20 @@ and that rewrite is what is emitted and copied. The worker prints the OPTIMIZING
 on its own stdout, the same channel MIC_READY and the LEVEL meters already use, immediately
 before the rewriting CLI starts.
 
+Auto-polish (--polish): after the chunks are merged and cleaned, the text is run through the
+same `claude -p` cleanup the --polish-last hotkey uses (pipeline.polish_with_status), and the
+polished text is what is emitted and copied. The worker prints the POLISHING phase marker on
+its own stdout immediately before that CLI starts, exactly as it does for OPTIMIZING.
+
+Precedence, when both --optimize-for and --polish are given: the OPTIMIZER WINS and the
+polish is skipped entirely. The rewrite already cleans up the same things the polish would,
+so running both would cost ~22s of LLM time for one dictation and throw half of it away.
+
 Exit codes: 0 success (text on stdout and, with --copy, on the clipboard), 3 nothing was
 captured (dictate.lua treats this as an aborted dictation: no paste, no error), 1 failure,
 4 the rewrite asked for by --optimize-for was unavailable so the RAW cleaned transcription
-was emitted and copied instead (the words are never lost, only left un-rewritten).
+was emitted and copied instead (the words are never lost, only left un-rewritten), 5 the
+same thing for --polish: the UNPOLISHED transcription was emitted and copied.
 
 Every run appends timestamped lines to the shared Scribe log (pipeline.log).
 """
@@ -101,6 +111,7 @@ LEVEL_QUEUE_MAX = 256
 EXIT_EMPTY = 3                             # nothing captured; dictate.lua resets quietly
 EXIT_FAIL = 1
 EXIT_OPTIMIZER_FALLBACK = 4                # same meaning as pipeline.EXIT_OPTIMIZER_FALLBACK
+EXIT_POLISH_FALLBACK = 5                   # same meaning as pipeline.EXIT_POLISH_FALLBACK
 
 
 def pcm_path():
@@ -619,7 +630,7 @@ def _report_levels_dropped(dropped):
         log("dropped %d meter reading(s): the stdout reader could not keep up" % dropped)
 
 
-def run_live(mic_index, cfg, copy=False, timings=False, optimize_for=None):
+def run_live(mic_index, cfg, copy=False, timings=False, optimize_for=None, polish=False):
     stop = threading.Event()
 
     def on_signal(_signum, _frame):
@@ -710,7 +721,7 @@ def run_live(mic_index, cfg, copy=False, timings=False, optimize_for=None):
     code = _finish(session, transcriber, cfg, copy, timings, t_release,
                    extra={"mic_ready": (t_ready - t_start) if t_ready else 0.0,
                           "record": total},
-                   optimize_for=optimize_for)
+                   optimize_for=optimize_for, polish=polish)
     if own_pcm:
         _quiet_remove(own_pcm)
     return code
@@ -736,7 +747,7 @@ def _stop_ffmpeg(proc, grace=5.0):
 # File mode
 # --------------------------------------------------------------------------------------
 
-def run_file(src, cfg, copy=False, timings=False, optimize_for=None):
+def run_file(src, cfg, copy=False, timings=False, optimize_for=None, polish=False):
     """Replay the live handoff logic over a recorded file, as if released at EOF."""
     if not os.path.exists(src):
         sys.stderr.write("input file not found: %s\n" % src)
@@ -778,7 +789,7 @@ def run_file(src, cfg, copy=False, timings=False, optimize_for=None):
     session.close_tail()
     code = _finish(session, transcriber, cfg, copy, timings, t_release,
                    extra={"decode": t_release - t_start, "record": total},
-                   optimize_for=optimize_for)
+                   optimize_for=optimize_for, polish=polish)
     _quiet_remove(path)
     return code
 
@@ -787,7 +798,34 @@ def run_file(src, cfg, copy=False, timings=False, optimize_for=None):
 # Shared finish
 # --------------------------------------------------------------------------------------
 
-def _finish(session, transcriber, cfg, copy, timings, t_release, extra, optimize_for=None):
+def _apply_polish(text, cfg):
+    """Auto-polish the finished transcription. Returns (text, exit_code_contribution).
+
+    The exit code is EXIT_POLISH_FALLBACK when the polish was asked for, was enabled, and still
+    could not run. The text coming back is then the unpolished transcription: as with the
+    optimizer, a pass that could not run must never cost the user their words, and the code is
+    the only signal that what reaches the clipboard is raw.
+
+    polish_blocked_reason() is consulted first (and is what keeps the POLISHING marker off
+    stdout when nothing is invoked). It includes config.json's "polish_enabled", deliberately:
+    auto-polish is the same pass that setting already governs, and dictate.lua only offers the
+    menu item when it is on.
+    """
+    blocked = pipeline.polish_blocked_reason(cfg)
+    if blocked:
+        log("auto-polish skipped: %s" % blocked)
+        sys.stderr.write("[polish skipped] %s\n" % blocked)
+        # Same rule as the batch path: a polish switched off in config is a setting and exits
+        # 0, a polish that is on but unavailable is a fallback worth reporting. dictate.lua
+        # only passes --polish when the config has it enabled, so the first case reaches here
+        # only from a hand-run command line.
+        return text, 0 if not cfg.get("polish_enabled") else EXIT_POLISH_FALLBACK
+    polished, ok = pipeline.polish_with_status(text, cfg)
+    return polished, 0 if ok else EXIT_POLISH_FALLBACK
+
+
+def _finish(session, transcriber, cfg, copy, timings, t_release, extra, optimize_for=None,
+            polish=False):
     transcriber.finish()
     if transcriber.error is not None:
         log("FAIL %s (audio kept at %s)" % (transcriber.error, transcriber.error.wav_path))
@@ -805,6 +843,12 @@ def _finish(session, transcriber, cfg, copy, timings, t_release, extra, optimize
 
     code = 0
     if optimize_for:
+        if polish:
+            # Precedence: the optimizer wins and the polish is skipped entirely. The rewrite
+            # cleans the same things the polish would, so running both would spend ~22s of LLM
+            # time on one dictation and throw half of it away.
+            log("auto-polish skipped: --optimize-for %s wins; the rewrite already cleans the "
+                "text" % optimize_for)
         optimized = pipeline.optimize_prompt(text, cfg, optimize_for)
         if optimized:
             text = optimized
@@ -812,6 +856,8 @@ def _finish(session, transcriber, cfg, copy, timings, t_release, extra, optimize
             # Emit the raw cleaned transcription anyway: a failed rewrite must never cost the
             # user their words. The exit code is the only signal that it was not rewritten.
             code = EXIT_OPTIMIZER_FALLBACK
+    elif polish:
+        text, code = _apply_polish(text, cfg)
 
     copied = emit(text, copy=copy)
     if timings:
@@ -836,8 +882,13 @@ def main(argv=None):
     ap.add_argument("--optimize-for", choices=list(pipeline.OPTIMIZE_TARGETS),
                     dest="optimize_for",
                     help="rewrite the dictation into a prompt aimed at this model instead of "
-                         "emitting the transcript; exits %d if the rewrite is unavailable"
+                         "emitting the transcript; exits %d if the rewrite is unavailable. "
+                         "Wins over --polish, which is then skipped entirely"
                          % EXIT_OPTIMIZER_FALLBACK)
+    ap.add_argument("--polish", action="store_true",
+                    help="auto-polish: run the finished transcription through the same LLM "
+                         "cleanup as the polish hotkey before emitting it; exits %d if the "
+                         "polish is unavailable" % EXIT_POLISH_FALLBACK)
     args = ap.parse_args(argv)
     if bool(args.mic) == bool(args.from_file):
         ap.error("give exactly one of --mic or --from-file")
@@ -856,15 +907,16 @@ def main(argv=None):
         if not pipeline.is_valid_language(args.language):
             ap.error('--language must be a 2-3 letter code such as "en" or "da", or "auto"')
         cfg["language"] = args.language
-    log("start mode=%s source=%s%s"
+    log("start mode=%s source=%s%s%s"
         % (mode, args.from_file or args.mic,
-           (" optimize-for=%s" % args.optimize_for) if args.optimize_for else ""))
+           (" optimize-for=%s" % args.optimize_for) if args.optimize_for else "",
+           " polish" if args.polish else ""))
     if args.from_file:
         code = run_file(args.from_file, cfg, copy=args.copy, timings=args.timings,
-                        optimize_for=args.optimize_for)
+                        optimize_for=args.optimize_for, polish=args.polish)
     else:
         code = run_live(args.mic, cfg, copy=args.copy, timings=args.timings,
-                        optimize_for=args.optimize_for)
+                        optimize_for=args.optimize_for, polish=args.polish)
     log("end mode=%s exit=%d %.2fs" % (mode, code, time.time() - started))
     return code
 
