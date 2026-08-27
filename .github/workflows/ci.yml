@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lua-syntax:
+    name: Lua syntax check (dictate.lua)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua 5.4
+        run: sudo apt-get update && sudo apt-get install -y lua5.4
+
+      - name: Parse-only check on dictate.lua
+        run: luac5.4 -p dictate.lua
+
+  python-tests:
+    name: Python test suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run pipeline tests
+        run: python3 test_pipeline.py
+
+      - name: Run stream worker tests
+        run: python3 test_stream_worker.py
