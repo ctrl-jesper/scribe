@@ -587,7 +587,7 @@ _saved_optimize = sw.pipeline.optimize_prompt
 REWRITE = "Context: a parser.\n\nTask: accept both formats."
 
 _never_called = []
-sw.pipeline.optimize_prompt = lambda text, cfg, target: _never_called.append(target)
+sw.pipeline.optimize_prompt = lambda text, cfg, target, status=None: _never_called.append(target)
 _plain_code, _plain_out, _plain_err = finish_capturing(["plain dictation"])
 check("without --optimize-for nothing is rewritten and the transcript is emitted",
       (_plain_code, _never_called, _plain_out), (0, [], "plain dictation\n"))
@@ -595,7 +595,7 @@ check("without --optimize-for nothing is rewritten and the transcript is emitted
 _opt_calls = []
 
 
-def _fake_optimize(text, cfg, target):
+def _fake_optimize(text, cfg, target, status=None):
     _opt_calls.append((text, target))
     return REWRITE
 
@@ -622,7 +622,7 @@ _copy_code, _copy_out, _ = finish_capturing(["the parser"], optimize_for="sonnet
 check("the rewrite is what reaches the clipboard", (_copy_code, _copied), (0, [REWRITE]))
 
 # Fallback: the rewrite could not be produced. The words must still be emitted and copied.
-sw.pipeline.optimize_prompt = lambda text, cfg, target: None
+sw.pipeline.optimize_prompt = lambda text, cfg, target, status=None: None
 _copied[:] = []
 _fb_code, _fb_out, _fb_err = finish_capturing(["keep my words"], optimize_for="opus", copy=True)
 check("a failed rewrite returns the fallback exit code", _fb_code, sw.EXIT_OPTIMIZER_FALLBACK)
@@ -749,7 +749,7 @@ _saved_optimize_again = sw.pipeline.optimize_prompt
 _precedence_calls = []
 
 
-def _spy_optimize(text, cfg, target):
+def _spy_optimize(text, cfg, target, status=None):
     _precedence_calls.append((text, target))
     return REWRITE
 
@@ -772,6 +772,43 @@ _ap_stale_code, _, _ = finish_capturing(["keep my words"], polish=True, copy=Tru
                                         cfg=dict(POLISH_CFG, claude_bin=_polish_failing))
 check("a failed clipboard copy wins over the polish fallback code too",
       _ap_stale_code, sw.EXIT_FAIL)
+sw.pipeline.copy_to_clipboard = _saved_copy
+
+
+# --- 6c3. a logged-out Claude CLI: the same fail-safe, one more specific exit code -----------
+# Exit 6 is exit 4 or 5 with the cause named. What must not change is the contract they share:
+# the words are still emitted and still copied, so the caller pastes exactly as it would on 0.
+_logged_out_claude = write_script("logged-out-claude",
+                                  'cat > /dev/null\n'
+                                  'printf "Not logged in - Please run /login\\n"\n'
+                                  'exit 1\n')
+AUTH_CFG = dict(POLISH_CFG, claude_bin=_logged_out_claude)
+
+_copied[:] = []
+sw.pipeline.copy_to_clipboard = lambda text: (_copied.append(text), True)[1]
+_auth_code, _auth_out, _auth_err = finish_capturing(["keep my words"], polish=True, copy=True,
+                                                    cfg=AUTH_CFG)
+check("a polish refused for want of a login returns the auth exit code",
+      _auth_code, sw.EXIT_AUTH_NEEDED)
+check("the worker and pipeline agree on the auth exit code",
+      (sw.EXIT_AUTH_NEEDED, p.EXIT_AUTH_NEEDED), (6, 6))
+check("a logged-out polish still emits the unpolished transcription",
+      "\n".join(_auth_out.splitlines()[1:]), "keep my words")
+check("a logged-out polish still copies the unpolished transcription", _copied, ["keep my words"])
+
+_copied[:] = []
+_auth_opt_code, _auth_opt_out, _ = finish_capturing(["keep my words"], optimize_for="opus",
+                                                    copy=True, cfg=AUTH_CFG)
+check("a rewrite refused for want of a login returns the auth exit code too",
+      _auth_opt_code, sw.EXIT_AUTH_NEEDED)
+check("a logged-out rewrite still copies the raw transcription", _copied, ["keep my words"])
+
+# An ordinary failure must NOT be reported as a login problem, or the alert would send the
+# user to fix something that is not broken.
+_plain_fb_code, _, _ = finish_capturing(["keep my words"], polish=True,
+                                        cfg=dict(POLISH_CFG, claude_bin=_polish_failing))
+check("an ordinary polish failure keeps the plain fallback code",
+      _plain_fb_code, sw.EXIT_POLISH_FALLBACK)
 sw.pipeline.copy_to_clipboard = _saved_copy
 
 

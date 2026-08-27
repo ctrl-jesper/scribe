@@ -769,6 +769,140 @@ check("an empty optimizer answer falls back", _empty_result, None)
 check("the empty fallback is reported on stderr", "[optimize fallback]" in _empty_err, True)
 
 
+# --- login state: reading `claude auth status`, and refusing to guess -----------------------
+# Every fake CLI here is a shell script this test wrote; the real claude CLI is never invoked
+# and nothing leaves the machine.
+check("the logged-out phrase is matched as the CLI actually prints it",
+      p.looks_logged_out("Not logged in · Please run /login"), True)
+check("matching is case-insensitive", p.looks_logged_out("NOT LOGGED IN"), True)
+check("an ordinary failure is not a login problem",
+      p.looks_logged_out("Error: model overloaded"), False)
+check("no output at all is not a login problem", p.looks_logged_out(""), False)
+check("a missing stream is not a login problem", p.looks_logged_out(None), False)
+
+AUTH_ENV = os.path.join(FAKE_BIN, "auth-env.txt")
+os.environ["SCRIBE_TEST_AUTH_ENV"] = AUTH_ENV
+_auth_in = write_script(
+    "auth-logged-in",
+    'printf "%s\\n" "$@" > "$SCRIBE_TEST_AUTH_ARGV"\n'
+    'printenv CLAUDE_TEST_MARKER > "$SCRIBE_TEST_AUTH_ENV" || : > "$SCRIBE_TEST_AUTH_ENV"\n'
+    'printf \'{"loggedIn": true, "authMethod": "claude.ai"}\\n\'\n')
+# The real CLI exits 1 when it is logged out, and still prints the same JSON. The state has
+# to come from the answer, not from the exit code, or this check would say nothing in exactly
+# the case it exists for. Both shapes are covered so a future CLI that exits 0 works too.
+_auth_out = write_script("auth-logged-out",
+                         'printf \'{"loggedIn": false, "authMethod": "none"}\\n\'\nexit 1\n')
+_auth_out_zero = write_script("auth-logged-out-rc0",
+                              'printf \'{"loggedIn": false}\\n\'\n')
+_auth_old = write_script("auth-old-cli",                     # a CLI without the subcommand
+                         'printf "unknown command: auth\\n" >&2\nexit 1\n')
+_auth_prose = write_script("auth-not-json", 'printf "Logged in as someone\\n"\n')
+_auth_odd = write_script("auth-odd-json", 'printf \'{"loggedIn": "yes"}\\n\'\n')
+AUTH_ARGV = os.path.join(FAKE_BIN, "auth-argv.txt")
+os.environ["SCRIBE_TEST_AUTH_ARGV"] = AUTH_ARGV
+
+
+def auth_cfg(claude_bin):
+    return dict(p.DEFAULTS, claude_bin=claude_bin)
+
+
+os.environ["CLAUDE_TEST_MARKER"] = "should-be-scrubbed"
+check("a CLI reporting loggedIn true is logged in",
+      p.claude_auth_state(auth_cfg(_auth_in)), p.AUTH_LOGGED_IN)
+check("the login check asks for `auth status`",
+      open(AUTH_ARGV).read().split(), ["auth", "status"])
+check("the login check scrubs the session environment too",
+      open(AUTH_ENV).read().strip(), "")
+del os.environ["CLAUDE_TEST_MARKER"]
+check("a CLI reporting loggedIn false is logged out, though it exits 1 doing so",
+      p.claude_auth_state(auth_cfg(_auth_out)), p.AUTH_LOGGED_OUT)
+check("the same answer with a zero exit reads the same",
+      p.claude_auth_state(auth_cfg(_auth_out_zero)), p.AUTH_LOGGED_OUT)
+check("a claude_bin that does not exist is not an error, just no CLI",
+      p.claude_auth_state(auth_cfg(os.path.join(FAKE_BIN, "no-such-claude"))), p.AUTH_NO_CLI)
+check("a CLI without the subcommand leaves the state unknown",
+      p.claude_auth_state(auth_cfg(_auth_old)), p.AUTH_UNKNOWN)
+check("an answer that is not JSON leaves the state unknown",
+      p.claude_auth_state(auth_cfg(_auth_prose)), p.AUTH_UNKNOWN)
+check("JSON without a boolean loggedIn leaves the state unknown",
+      p.claude_auth_state(auth_cfg(_auth_odd)), p.AUTH_UNKNOWN)
+_auth_unrunnable = os.path.join(FAKE_BIN, "auth-unrunnable")
+with open(_auth_unrunnable, "w") as _fh:
+    _fh.write("#!/bin/sh\nexit 0\n")
+os.chmod(_auth_unrunnable, 0o644)
+check("a claude_bin that cannot be executed leaves the state unknown",
+      p.claude_auth_state(auth_cfg(_auth_unrunnable)), p.AUTH_UNKNOWN)
+
+# The timeout is stubbed rather than waited out: a 15s sleep in the suite would be a test that
+# nobody runs twice.
+_saved_auth_run = p.subprocess.run
+
+
+def _auth_timeout_run(*_args, **_kwargs):
+    raise p.subprocess.TimeoutExpired(cmd="claude auth status", timeout=p.AUTH_CHECK_TIMEOUT_S)
+
+
+p.subprocess.run = _auth_timeout_run
+check("a check that times out leaves the state unknown",
+      p.claude_auth_state(auth_cfg(_auth_in)), p.AUTH_UNKNOWN)
+p.subprocess.run = _saved_auth_run
+
+# Only a positive "logged out" is worth telling the user about.
+check("the logged-out CLI produces a reason line",
+      "not logged in" in (p.logged_out_reason(auth_cfg(_auth_out)) or ""), True)
+check("the reason line names the CLI and the fix",
+      (_auth_out in p.logged_out_reason(auth_cfg(_auth_out)),
+       "claude /login" in p.logged_out_reason(auth_cfg(_auth_out))), (True, True))
+check("a logged-in CLI produces no reason", p.logged_out_reason(auth_cfg(_auth_in)), None)
+check("an absent CLI produces no reason",
+      p.logged_out_reason(auth_cfg(os.path.join(FAKE_BIN, "no-such-claude"))), None)
+check("an undeterminable CLI produces no reason", p.logged_out_reason(auth_cfg(_auth_old)), None)
+
+
+# --- login state: a logged-out CLI is told apart from any other polish or rewrite failure ----
+# The polish and the rewrite both keep falling back to the user's words. The only thing that
+# changes is which fallback exit code the caller is given.
+_logged_out_claude = write_script("logged-out-claude",
+                                  'cat > /dev/null\n'
+                                  'printf "Not logged in - Please run /login\\n"\n'
+                                  'exit 1\n')
+
+_auth_status = {}
+_auth_polish, _, _auth_polish_err = polish_capturing(
+    p.polish_with_status, "keep my words", dict(_polish_cfg, claude_bin=_logged_out_claude),
+    _auth_status)
+check("a logged-out polish still returns the unpolished words",
+      _auth_polish, ("keep my words", False))
+check("a logged-out polish reports that the login is what is missing",
+      _auth_status.get("auth_needed"), True)
+
+_other_status = {}
+polish_capturing(p.polish_with_status, "keep my words",
+                 dict(_polish_cfg, claude_bin=_failing_claude), _other_status)
+check("an ordinary polish failure is not reported as a login problem",
+      _other_status.get("auth_needed"), None)
+
+def optimize_status(claude_bin):
+    """Run the rewrite against `claude_bin` with stdout captured. Returns (result, status)."""
+    status = {}
+    saved_out, saved_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+    try:
+        result = p.optimize_prompt("keep my words", dict(OPT_CFG, claude_bin=claude_bin),
+                                   "opus", status)
+    finally:
+        sys.stdout, sys.stderr = saved_out, saved_err
+    return result, status
+
+
+_opt_auth, _opt_auth_status = optimize_status(_logged_out_claude)
+check("a logged-out rewrite still falls back", _opt_auth, None)
+check("a logged-out rewrite reports that the login is what is missing",
+      _opt_auth_status.get("auth_needed"), True)
+check("an ordinary rewrite failure is not reported as a login problem",
+      optimize_status(_opt_failing)[1].get("auth_needed"), None)
+
+
 # --- clipboard: a failed pbcopy must not look like success ---------------------------------
 # subprocess.run is stubbed rather than calling the real pbcopy: the test must not touch the
 # clipboard of whoever runs it.
@@ -1111,6 +1245,59 @@ check("the skipped polish is logged",
 check("exit 5 is distinct from every other exit code",
       (p.EXIT_POLISH_FALLBACK, p.EXIT_OPTIMIZER_FALLBACK, p.EXIT_EMPTY, p.EXIT_FAIL),
       (5, 4, 3, 1))
+
+
+# --- login state end to end: exit 6, and the --check-auth mode -------------------------------
+# Exit 6 is exit 4 or 5 with the cause named, so the contract that matters is unchanged: the
+# words are printed and copied, and only the code the caller sees is different.
+POLISH_LOGGED_OUT_HOME = polish_home(_logged_out_claude, "scribe-test-polish-auth-")
+StubWhisper.text = "words a logged-out CLI could not polish"
+_full_auth = run_cli([recorded_wav(POLISH_LOGGED_OUT_HOME), "--mode", "full", "--copy"],
+                     home=POLISH_LOGGED_OUT_HOME)
+check("a polish refused for want of a login exits 6", _full_auth.returncode, p.EXIT_AUTH_NEEDED)
+check("the unpolished words are still on the clipboard",
+      open(CLIPBOARD).read(), "words a logged-out CLI could not polish")
+check("the login fallback is logged",
+      "AUTH-NEEDED" in cli_state("scribe.log", POLISH_LOGGED_OUT_HOME), True)
+
+OPT_LOGGED_OUT_HOME = optimize_home(_logged_out_claude, "scribe-test-opt-auth-")
+StubWhisper.text = "words a logged-out CLI could not rewrite"
+_opt_auth_run = run_cli([recorded_wav(OPT_LOGGED_OUT_HOME), "--optimize-for", "opus", "--copy"],
+                        home=OPT_LOGGED_OUT_HOME)
+check("a rewrite refused for want of a login exits 6",
+      _opt_auth_run.returncode, p.EXIT_AUTH_NEEDED)
+check("the un-rewritten words are still on the clipboard",
+      open(CLIPBOARD).read(), "words a logged-out CLI could not rewrite")
+
+check("exit 6 is distinct from every other exit code",
+      (p.EXIT_AUTH_NEEDED, p.EXIT_POLISH_FALLBACK, p.EXIT_OPTIMIZER_FALLBACK,
+       p.EXIT_EMPTY, p.EXIT_FAIL), (6, 5, 4, 3, 1))
+
+# --check-auth: one line and exit 1 only when the CLI positively says it is logged out.
+AUTH_OUT_HOME = polish_home(_auth_out, "scribe-test-auth-out-")
+_check_out = run_cli(["--check-auth"], home=AUTH_OUT_HOME)
+check("--check-auth exits 1 for a logged-out CLI", _check_out.returncode, 1)
+check("--check-auth prints exactly one line", len(_check_out.stdout.strip().splitlines()), 1)
+check("--check-auth names the CLI and the fix",
+      (_auth_out in _check_out.stdout, "claude /login" in _check_out.stdout), (True, True))
+
+AUTH_IN_HOME = polish_home(_auth_in, "scribe-test-auth-in-")
+_check_in = run_cli(["--check-auth"], home=AUTH_IN_HOME)
+check("--check-auth is silent and exits 0 for a logged-in CLI",
+      (_check_in.returncode, _check_in.stdout.strip()), (0, ""))
+
+AUTH_GONE_HOME = polish_home(os.path.join(FAKE_BIN, "no-such-claude"), "scribe-test-auth-gone-")
+_check_gone = run_cli(["--check-auth"], home=AUTH_GONE_HOME)
+check("--check-auth is silent and exits 0 when no CLI is installed",
+      (_check_gone.returncode, _check_gone.stdout.strip()), (0, ""))
+
+AUTH_OLD_HOME = polish_home(_auth_old, "scribe-test-auth-old-")
+_check_old = run_cli(["--check-auth"], home=AUTH_OLD_HOME)
+check("--check-auth is silent and exits 0 for a CLI without the subcommand",
+      (_check_old.returncode, _check_old.stdout.strip()), (0, ""))
+
+check("--check-auth transcribes nothing and leaves the clipboard alone",
+      open(CLIPBOARD).read(), "words a logged-out CLI could not rewrite")
 
 
 fails = [c for c in cases if not c[1]]

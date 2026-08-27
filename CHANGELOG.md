@@ -2,6 +2,22 @@
 
 All notable changes to Scribe are documented in this file.
 
+## [0.4.1] - 2026-08-27
+
+### Added
+
+- A logged-out Claude CLI is now named as the cause instead of hiding behind "polish
+  unavailable". Scribe checks the CLI's login state once when Hammerspoon loads and says
+  what to run (`claude /login`), and a dictation whose polish or prompt rewrite was refused
+  for want of a login reports it with its own exit code and its own notice. The words are
+  pasted either way, exactly as before: a pass that could not run has never been allowed to
+  cost you your dictation.
+- `python3 pipeline.py --check-auth`: prints one line and exits 1 when the configured Claude
+  CLI reports itself logged out, and exits 0 in silence otherwise, including when no CLI is
+  installed (a valid setup: the AI passes are optional) or when the CLI is too old to answer
+  the question. `scribe_setup.py --selftest` reports the same state as one informational
+  line.
+
 ## [0.4.0] - 2026-08-26
 
 ### Added

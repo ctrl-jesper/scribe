@@ -586,6 +586,31 @@ SAMPLE_LISTING = """ffmpeg version 8.1.2 Copyright (c) 2000-2026 the FFmpeg deve
 """
 
 
+def claude_login_line() -> str:
+    """One informational line about the Claude CLI's login state, for the selftest.
+
+    The check itself lives in pipeline.py so the wizard, dictate.lua and the dictation paths
+    all agree on what "logged out" means. Every failure is reported as "cannot be determined":
+    this is information, never a verdict, and it must never fail the selftest.
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import pipeline
+
+        state = pipeline.claude_auth_state(pipeline.load_config())
+    except Exception as exc:
+        return "claude CLI login: cannot be determined (%s)" % exc
+    return {
+        pipeline.AUTH_LOGGED_IN: "claude CLI login: logged in",
+        pipeline.AUTH_LOGGED_OUT:
+            "claude CLI login: NOT logged in; polish and prompt mode will paste raw text "
+            "until you run: claude /login",
+        pipeline.AUTH_NO_CLI:
+            "claude CLI login: not configured (no CLI at the configured claude_bin), so the "
+            "optional polish and prompt passes are off",
+    }.get(state, "claude CLI login: cannot be determined")
+
+
 def run_selftest() -> int:
     checks = 0
 
@@ -685,6 +710,7 @@ def run_selftest() -> int:
         assert load_json(os.path.join(directory, "bad.json"), {"a": 1}) == {"a": 1}
         checks += 4
 
+    print(claude_login_line())
     print("selftest: %d checks passed" % checks)
     return 0
 

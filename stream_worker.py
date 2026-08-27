@@ -45,7 +45,10 @@ Exit codes: 0 success (text on stdout and, with --copy, on the clipboard), 3 not
 captured (dictate.lua treats this as an aborted dictation: no paste, no error), 1 failure,
 4 the rewrite asked for by --optimize-for was unavailable so the RAW cleaned transcription
 was emitted and copied instead (the words are never lost, only left un-rewritten), 5 the
-same thing for --polish: the UNPOLISHED transcription was emitted and copied.
+same thing for --polish: the UNPOLISHED transcription was emitted and copied, 6 either of
+those two, with the cause identified: the Claude CLI answered that it is not logged in. The
+words are emitted and copied on 6 exactly as on 4 and 5; the only difference is that the
+caller can name the fix (`claude /login`) instead of saying "unavailable".
 
 Every run appends timestamped lines to the shared Scribe log (pipeline.log).
 """
@@ -112,6 +115,7 @@ EXIT_EMPTY = 3                             # nothing captured; dictate.lua reset
 EXIT_FAIL = 1
 EXIT_OPTIMIZER_FALLBACK = 4                # same meaning as pipeline.EXIT_OPTIMIZER_FALLBACK
 EXIT_POLISH_FALLBACK = 5                   # same meaning as pipeline.EXIT_POLISH_FALLBACK
+EXIT_AUTH_NEEDED = 6                       # same meaning as pipeline.EXIT_AUTH_NEEDED
 
 
 def pcm_path():
@@ -802,9 +806,10 @@ def _apply_polish(text, cfg):
     """Auto-polish the finished transcription. Returns (text, exit_code_contribution).
 
     The exit code is EXIT_POLISH_FALLBACK when the polish was asked for, was enabled, and still
-    could not run. The text coming back is then the unpolished transcription: as with the
-    optimizer, a pass that could not run must never cost the user their words, and the code is
-    the only signal that what reaches the clipboard is raw.
+    could not run, or EXIT_AUTH_NEEDED when the reason was that the Claude CLI is not logged
+    in. The text coming back is then the unpolished transcription: as with the optimizer, a
+    pass that could not run must never cost the user their words, and the code is the only
+    signal that what reaches the clipboard is raw.
 
     polish_blocked_reason() is consulted first (and is what keeps the POLISHING marker off
     stdout when nothing is invoked). It includes config.json's "polish_enabled", deliberately:
@@ -820,8 +825,11 @@ def _apply_polish(text, cfg):
         # only passes --polish when the config has it enabled, so the first case reaches here
         # only from a hand-run command line.
         return text, 0 if not cfg.get("polish_enabled") else EXIT_POLISH_FALLBACK
-    polished, ok = pipeline.polish_with_status(text, cfg)
-    return polished, 0 if ok else EXIT_POLISH_FALLBACK
+    status = {}
+    polished, ok = pipeline.polish_with_status(text, cfg, status)
+    if ok:
+        return polished, 0
+    return polished, EXIT_AUTH_NEEDED if status.get("auth_needed") else EXIT_POLISH_FALLBACK
 
 
 def _finish(session, transcriber, cfg, copy, timings, t_release, extra, optimize_for=None,
@@ -849,13 +857,15 @@ def _finish(session, transcriber, cfg, copy, timings, t_release, extra, optimize
             # time on one dictation and throw half of it away.
             log("auto-polish skipped: --optimize-for %s wins; the rewrite already cleans the "
                 "text" % optimize_for)
-        optimized = pipeline.optimize_prompt(text, cfg, optimize_for)
+        status = {}
+        optimized = pipeline.optimize_prompt(text, cfg, optimize_for, status)
         if optimized:
             text = optimized
         else:
             # Emit the raw cleaned transcription anyway: a failed rewrite must never cost the
-            # user their words. The exit code is the only signal that it was not rewritten.
-            code = EXIT_OPTIMIZER_FALLBACK
+            # user their words. The exit code is the only signal that it was not rewritten,
+            # and a CLI that said it is logged out gets the code that names the fix.
+            code = EXIT_AUTH_NEEDED if status.get("auth_needed") else EXIT_OPTIMIZER_FALLBACK
     elif polish:
         text, code = _apply_polish(text, cfg)
 

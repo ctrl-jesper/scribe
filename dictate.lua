@@ -807,6 +807,13 @@ local function transcribeAndPaste()
             hs.eventtap.keyStroke({ "cmd" }, "v")
             alertProblem("polish unavailable, pasted the unpolished transcription", 2.5)
             log("pipeline stderr: " .. (stderr or ""))
+        elseif exitCode == 6 then
+            -- Same contract again, with the cause known: the AI pass never ran because the
+            -- Claude CLI is logged out. Say the fix rather than "unavailable".
+            hs.eventtap.keyStroke({ "cmd" }, "v")
+            alertProblem("Claude CLI not logged in (run: claude /login), pasted the raw "
+                .. "transcription", 2.5)
+            log("pipeline stderr: " .. (stderr or ""))
         elseif exitCode == 3 then
             return                                                -- nothing was said: reset quietly
         else
@@ -903,6 +910,13 @@ local function streamWorkerFinished(exitCode, _, stderr)
         -- Same again for the auto-polish: the words are on the clipboard, unpolished.
         hs.eventtap.keyStroke({ "cmd" }, "v")
         alertProblem("polish unavailable, pasted the unpolished transcription", 2.5)
+        log("stream worker stderr: " .. (stderr or ""))
+    elseif exitCode == 6 then
+        -- Same contract, cause known: the AI pass never ran because the Claude CLI is logged
+        -- out. Say the fix rather than "unavailable".
+        hs.eventtap.keyStroke({ "cmd" }, "v")
+        alertProblem("Claude CLI not logged in (run: claude /login), pasted the raw "
+            .. "transcription", 2.5)
         log("stream worker stderr: " .. (stderr or ""))
     elseif exitCode == 3 then
         return                                                     -- empty/aborted dictation: reset quietly
@@ -1178,6 +1192,24 @@ else
         end
     end, { "-c", "import sys" })
     scribe.pythonCheck:start()
+
+    -- The polish and prompt passes run the user's own Claude CLI, and a logged-out CLI fails
+    -- every one of them the same way. Say it once here, where the fix is one command, instead
+    -- of leaving the user to discover it mid-dictation. Exit 1 means logged out and the line
+    -- to show is on stdout; every other outcome exits 0 and says nothing, deliberately, since
+    -- no CLI configured and a CLI too old for the subcommand are both fine setups. Async, like
+    -- everything else here.
+    scribe.authCheck = hs.task.new(PYTHON, function(exitCode, stdOut, stderr)
+        if exitCode ~= 0 then
+            local message = (stdOut or ""):match("^%s*(.-)%s*$")
+            if message == "" then
+                message = "Claude CLI not logged in - run: claude /login"
+            end
+            alertProblem(message, 8)
+            log("auth check stderr: " .. (stderr or ""))
+        end
+    end, { PIPELINE, "--check-auth" })
+    scribe.authCheck:start()
 end
 if not scribe.micName then
     alertProblem("no microphone configured. Run: python3 " .. APP_DIR .. "/scribe_setup.py", 8)

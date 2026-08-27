@@ -5,6 +5,7 @@ Usage:
     python3 pipeline.py <audio.wav> [--mode dict|full] [--copy] [--timings]
                         [--max-age SECONDS] [--not-older-than EPOCH] [--consume]
                         [--optimize-for fable|opus|sonnet]
+    python3 pipeline.py --check-auth
 
 Modes:
     dict  : transcribe + deterministic dictionary only (instant, free, no LLM)
@@ -60,6 +61,19 @@ Exit codes:
        "polish_enabled": false, which is a setting rather than a failure and has always been
        silent, and --polish-last, whose caller pastes only on exit 0, so reporting a fallback
        there would paste nothing at all.
+    6  the same situation as 4 or 5, with the cause identified: the Claude CLI said it is not
+       logged in. The text on stdout and on the clipboard is the raw (or unpolished) one, and
+       the caller should still paste it; the only difference from 4 and 5 is that the caller
+       can name the fix (`claude /login`) instead of saying "unavailable". If the CLI ever
+       words that answer differently, the run degrades to 4 or 5 and nothing else changes.
+
+The --check-auth mode:
+    Runs `claude auth status` and prints one line, then exits 1, when that CLI is logged out.
+    Exits 0 in silence on every other outcome, including a claude_bin that is not installed
+    (a valid setup: the polish and prompt passes are optional) and a CLI too old to have the
+    subcommand. It transcribes nothing and touches neither the clipboard nor the state files;
+    dictate.lua runs it once at load so a logged-out CLI is reported before a dictation hits
+    it rather than after.
 
 Phase markers on stdout:
     OPTIMIZING  printed on its own line immediately before the optimizer CLI is invoked, so
@@ -89,6 +103,7 @@ EXIT_FAIL = 1
 EXIT_EMPTY = 3                      # same meaning as stream_worker.py's EXIT_EMPTY
 EXIT_OPTIMIZER_FALLBACK = 4         # same meaning as stream_worker.py's EXIT_OPTIMIZER_FALLBACK
 EXIT_POLISH_FALLBACK = 5            # same meaning as stream_worker.py's EXIT_POLISH_FALLBACK
+EXIT_AUTH_NEEDED = 6                # same meaning as stream_worker.py's EXIT_AUTH_NEEDED
 
 DEFAULT_MAX_AGE_S = 3600.0          # see the session-provenance note above
 
@@ -97,6 +112,7 @@ PHASE_OPTIMIZING = "OPTIMIZING"     # stdout phase marker; the caller watches fo
 PHASE_POLISHING = "POLISHING"       # the same marker mechanism for the polish pass
 OPTIMIZER_TIMEOUT_S = 120.0         # same budget as the polish pass
 POLISH_TIMEOUT_S = 120.0            # how long `claude -p` may take to clean one dictation
+AUTH_CHECK_TIMEOUT_S = 15.0         # `claude auth status` answers locally; it never needs long
 
 # Every value the tool needs if config.json is missing a key (or missing entirely).
 DEFAULTS = {
@@ -667,6 +683,95 @@ def collapse_repetitions(text):
 
 
 # --------------------------------------------------------------------------------------
+# Claude CLI login state
+# --------------------------------------------------------------------------------------
+
+# What the four states mean to a caller: LOGGED_OUT is the only one worth telling the user
+# about, and UNKNOWN deliberately covers every "cannot tell" (an older CLI without the
+# subcommand, an answer that is not the JSON we expect, a check that timed out or could not
+# be run). Guessing "logged out" from an unrecognised answer would nag a user whose setup is
+# perfectly fine.
+AUTH_LOGGED_IN = "logged-in"
+AUTH_LOGGED_OUT = "logged-out"
+AUTH_NO_CLI = "no-cli"
+AUTH_UNKNOWN = "unknown"
+
+# The phrase the CLI prints when a call fails because nobody is signed in, matched
+# case-insensitively. Observed directly against a logged-out CLI: stdout carries
+# "Not logged in · Please run /login", stderr is empty, and the exit code is 1.
+_LOGGED_OUT_PHRASE = "not logged in"
+
+
+def scrubbed_env():
+    """os.environ without the Claude Code session variables, for any nested CLI call.
+
+    A Claude Code session exports variables that redirect a nested CLI to a session gateway,
+    where it 401s. They are absent in a normal Terminal or Hammerspoon launch, so removing
+    them is a no-op there and makes every one of these calls safe to run from inside a Claude
+    Code shell.
+    """
+    return {k: v for k, v in os.environ.items()
+            if not k.startswith(("CLAUDE", "ANTHROPIC", "AI_AGENT"))}
+
+
+def looks_logged_out(cli_output):
+    """True when the CLI's own output says the call failed for want of a login.
+
+    The wording belongs to the CLI, not to us, so a future release that words it differently
+    simply stops matching here and the run reports the generic fallback it always did.
+    """
+    return _LOGGED_OUT_PHRASE in (cli_output or "").lower()
+
+
+def auth_status_argv(cfg):
+    """`claude auth status`, which prints a JSON object with a "loggedIn" boolean."""
+    return [os.path.expanduser(cfg["claude_bin"]), "auth", "status"]
+
+
+def claude_auth_state(cfg):
+    """Ask the configured Claude CLI whether it is logged in. Returns one of the AUTH_* states.
+
+    Never raises and never blocks for long: this runs at Hammerspoon load time and from the
+    setup wizard's selftest, where an exception or a hang would be a far worse outcome than
+    an unanswered question.
+    """
+    claude_bin = os.path.expanduser(cfg["claude_bin"])
+    if not os.path.exists(claude_bin):
+        return AUTH_NO_CLI
+    try:
+        proc = subprocess.run(auth_status_argv(cfg), capture_output=True, text=True,
+                              env=scrubbed_env(), timeout=AUTH_CHECK_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        # Not executable, no such subcommand handler, or it never answered. All of them mean
+        # the same thing here: we do not know, so we say nothing.
+        return AUTH_UNKNOWN
+    # The exit code is deliberately NOT consulted. Verified against the CLI: logged in is
+    # rc=0, logged OUT is rc=1 and still prints the same JSON, so rejecting a nonzero exit
+    # here would leave this check silent in the one case it exists for. What still leaves the
+    # state unknown is an answer that is not the JSON we expect, which is what a CLI too old
+    # for the subcommand produces.
+    try:
+        answer = json.loads(proc.stdout)
+    except ValueError:
+        return AUTH_UNKNOWN
+    if not isinstance(answer, dict) or not isinstance(answer.get("loggedIn"), bool):
+        return AUTH_UNKNOWN
+    return AUTH_LOGGED_IN if answer["loggedIn"] else AUTH_LOGGED_OUT
+
+
+def logged_out_reason(cfg):
+    """The one line --check-auth prints, or None when there is nothing to report.
+
+    None covers "logged in", "no CLI installed" and "could not tell" alike: only a CLI that
+    positively reports itself logged out is worth interrupting the user for.
+    """
+    if claude_auth_state(cfg) != AUTH_LOGGED_OUT:
+        return None
+    return ("Claude CLI at %s is not logged in; polish and prompt mode will paste raw text "
+            "until you run: claude /login" % os.path.expanduser(cfg["claude_bin"]))
+
+
+# --------------------------------------------------------------------------------------
 # Optional LLM polish
 # --------------------------------------------------------------------------------------
 
@@ -714,13 +819,17 @@ def llm_polish(text, cfg):
     return polish_with_status(text, cfg)[0]
 
 
-def polish_with_status(text, cfg):
+def polish_with_status(text, cfg, status=None):
     """Polish `text`, and say whether the polish actually happened.
 
     Returns (text, polished). `polished` is False when the CLI failed, timed out or answered
     with nothing, in which case the returned text is the unpolished input: the user's words
     are never lost, so the exit code is the only thing that can tell the caller they were not
     cleaned (EXIT_POLISH_FALLBACK).
+
+    `status`, when a dict is passed, is filled in with what the pair cannot carry:
+    status["auth_needed"] becomes True when the CLI's answer says it is not logged in, which
+    is the difference between EXIT_POLISH_FALLBACK and the more specific EXIT_AUTH_NEEDED.
 
     Runs in an empty temporary directory OUTSIDE $HOME: the old cwd was inside the Scribe
     config directory, so the CLI's upward CLAUDE.md search still reached ~/CLAUDE.md.
@@ -730,11 +839,7 @@ def polish_with_status(text, cfg):
     """
     empty_cwd = tempfile.mkdtemp(prefix="scribe-polish-")
     prompt = build_polish_input(text, cfg)
-    # Strip any Claude Code session auth vars that would redirect the nested CLI to a
-    # session gateway and 401. Absent in a normal Terminal / Hammerspoon launch; scrubbing
-    # them is a no-op there and makes this robust if ever run from inside a Claude Code shell.
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("CLAUDE", "ANTHROPIC", "AI_AGENT"))}
+    env = scrubbed_env()
     print_phase_marker(PHASE_POLISHING)   # last thing before the CLI starts, never after a failure
     try:
         proc = subprocess.run(polish_argv(cfg), input=prompt, capture_output=True, text=True,
@@ -758,6 +863,8 @@ def polish_with_status(text, cfg):
     if proc.returncode != 0 or not result:
         # Fail safe: never lose the user's words. Fall back to the pre-polish text.
         # The CLI prints auth errors to stdout, so include it in the diagnostic.
+        if status is not None and looks_logged_out(proc.stdout):
+            status["auth_needed"] = True
         log("polish fallback: rc=%s out=%r err=%r"
             % (proc.returncode, result[:200], proc.stderr.strip()[:200]))
         sys.stderr.write(f"[llm_polish fallback] rc={proc.returncode} "
@@ -832,12 +939,16 @@ def sanitize_optimized(text):
     return _BLANK_RUN.sub("\n\n", cleaned).strip()
 
 
-def optimize_prompt(text, cfg, target):
+def optimize_prompt(text, cfg, target, status=None):
     """Rewrite the dictation into a prompt for `target`. Returns None if that was not possible.
 
     None means "fall back": the caller keeps the unoptimized text, which is what actually
     reaches the clipboard, and exits EXIT_OPTIMIZER_FALLBACK so the user knows the words are
     raw. Losing the dictation is never an acceptable outcome of a failed rewrite.
+
+    `status`, when a dict is passed, is filled in the same way polish_with_status fills it:
+    status["auth_needed"] becomes True when the CLI answered that it is not logged in, which
+    turns the caller's fallback code into the more specific EXIT_AUTH_NEEDED.
 
     The rewrite always runs on cfg["claude_model"]; `target` only selects a directive block.
     Isolation matches llm_polish: no tools, no MCP servers, safe mode, a scrubbed environment
@@ -850,8 +961,7 @@ def optimize_prompt(text, cfg, target):
         return None
 
     prompt = build_optimizer_input(text, target)
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("CLAUDE", "ANTHROPIC", "AI_AGENT"))}
+    env = scrubbed_env()
     empty_cwd = tempfile.mkdtemp(prefix="scribe-optimize-")
     print_phase_marker()            # last thing before the CLI starts, never after a failure
     try:
@@ -868,6 +978,8 @@ def optimize_prompt(text, cfg, target):
     result = proc.stdout.strip()
     if proc.returncode != 0 or not result:
         # The CLI prints auth errors to stdout, so both streams go into the diagnostic.
+        if status is not None and looks_logged_out(proc.stdout):
+            status["auth_needed"] = True
         log("optimizer fallback: rc=%s out=%r err=%r"
             % (proc.returncode, result[:200], proc.stderr.strip()[:200]))
         sys.stderr.write("[optimize fallback] rc=%s out=%s err=%s\n"
@@ -891,8 +1003,9 @@ def run(wav_path, mode, cfg, timings=False, max_age=DEFAULT_MAX_AGE_S,
 
     `status`, when a dict is passed, is filled in with what the return value cannot carry:
     status["polish_fallback"] becomes True if mode == "full" asked for a polish that could not
-    run. The text itself is returned on every path either way, so a caller that does not care
-    (the streaming tests, an interactive run) can ignore it entirely.
+    run, and status["auth_needed"] if the reason was that the CLI is not logged in. The text
+    itself is returned on every path either way, so a caller that does not care (the streaming
+    tests, an interactive run) can ignore it entirely.
     """
     check_audio_freshness(wav_path, max_age=max_age, not_older_than=not_older_than)
     t = {}
@@ -923,7 +1036,7 @@ def run(wav_path, mode, cfg, timings=False, max_age=DEFAULT_MAX_AGE_S,
                 status["polish_fallback"] = True
         else:
             t2 = time.time()
-            text, polished = polish_with_status(text, cfg); t["llm"] = time.time() - t2
+            text, polished = polish_with_status(text, cfg, status); t["llm"] = time.time() - t2
             if not polished and status is not None:
                 status["polish_fallback"] = True
     if timings:
@@ -951,6 +1064,26 @@ def polish_last(cfg):
     return llm_polish(text, cfg)
 
 
+def run_auth_check():
+    """--check-auth: one line and exit 1 if the Claude CLI is logged out, else exit 0 in silence.
+
+    Deliberately quiet about everything else, including a config that will not even load: this
+    runs unattended at Hammerspoon load time, where the only useful thing to say is the one
+    thing the user can act on. Every other problem already has its own message on the paths
+    that actually need the config.
+    """
+    try:
+        reason = logged_out_reason(load_config())
+    except RuntimeError as exc:
+        log("auth check skipped: %s" % exc)
+        return 0
+    if reason is None:
+        return 0
+    log("auth check: %s" % reason)
+    print(reason)
+    return 1
+
+
 def copy_to_clipboard(text):
     """Put `text` on the clipboard. False if pbcopy failed.
 
@@ -975,6 +1108,9 @@ if __name__ == "__main__":
                          % EXIT_POLISH_FALLBACK)
     ap.add_argument("--polish-last", action="store_true",
                     help="LLM-polish the previous instant dictation instead of recording")
+    ap.add_argument("--check-auth", action="store_true", dest="check_auth",
+                    help="transcribe nothing; print one line and exit 1 if the Claude CLI is "
+                         "logged out, otherwise exit 0 silently")
     ap.add_argument("--copy", action="store_true", help="also copy result to clipboard")
     ap.add_argument("--timings", action="store_true", help="print per-stage timings to stderr")
     ap.add_argument("--max-age", type=float, default=DEFAULT_MAX_AGE_S, metavar="SECONDS",
@@ -994,6 +1130,10 @@ if __name__ == "__main__":
                          'config "mode": "full" is downgraded to dict'
                          % EXIT_OPTIMIZER_FALLBACK)
     args = ap.parse_args()
+    if args.check_auth:
+        # A mode of its own: it records nothing, needs no audio, and exits before any of the
+        # dictation flags below can matter.
+        raise SystemExit(run_auth_check())
     if args.optimize_for and args.mode == "full":
         # Prompt mode always starts from the dict-mode text: polishing the transcript first
         # would spend a second LLM call reshaping words the rewrite is about to replace.
@@ -1004,6 +1144,9 @@ if __name__ == "__main__":
                  "fresh dictation, not the previous instant result")
     started = time.time()
     mode = "polish-last" if args.polish_last else (args.mode or "?")
+    # One status dict for the whole run, shared by the polish inside run() and the optimizer
+    # below. They cannot both fill it in: --optimize-for pins the mode to dict, so the polish
+    # never runs on a run that also rewrites.
     status = {}
     try:
         cfg = load_config()
@@ -1038,23 +1181,26 @@ if __name__ == "__main__":
         raise SystemExit(EXIT_EMPTY)
     exit_code = 0
     if args.optimize_for:
-        optimized = optimize_prompt(result, cfg, args.optimize_for)
+        optimized = optimize_prompt(result, cfg, args.optimize_for, status)
         if optimized:
             result = optimized
         else:
             # The unoptimized transcript is still what gets copied and printed below; the
-            # exit code is the only thing that tells the caller it was not rewritten.
-            exit_code = EXIT_OPTIMIZER_FALLBACK
+            # exit code is the only thing that tells the caller it was not rewritten. A CLI
+            # that said it is logged out gets the more specific code, so the caller can name
+            # the fix instead of reporting "unavailable".
+            exit_code = EXIT_AUTH_NEEDED if status.get("auth_needed") else EXIT_OPTIMIZER_FALLBACK
     elif status.get("polish_fallback"):
         # Same shape: the unpolished transcript is copied and printed below either way.
-        exit_code = EXIT_POLISH_FALLBACK
+        exit_code = EXIT_AUTH_NEEDED if status.get("auth_needed") else EXIT_POLISH_FALLBACK
     write_state(OUTPUT_PATH, result)   # persist for the recall hotkey
     if args.copy and not copy_to_clipboard(result):
         raise SystemExit(EXIT_FAIL)
     print(result)
     outcome = {0: "OK",
                EXIT_OPTIMIZER_FALLBACK: "OPTIMIZER-FALLBACK",
-               EXIT_POLISH_FALLBACK: "POLISH-FALLBACK"}[exit_code]
+               EXIT_POLISH_FALLBACK: "POLISH-FALLBACK",
+               EXIT_AUTH_NEEDED: "AUTH-NEEDED"}[exit_code]
     log("%s mode=%s %.2fs %d chars" % (outcome, mode, time.time() - started, len(result)))
     if exit_code:
         raise SystemExit(exit_code)
