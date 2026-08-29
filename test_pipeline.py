@@ -913,6 +913,31 @@ for _target in p.OPTIMIZE_TARGETS:
           "Output ONLY the rewritten prompt" in _built, True)
     check("optimizer prompt for %s allows a multi-line answer" % _target,
           "may span several lines" in _built, True)
+    check("optimizer prompt for %s marks the target block as guidance, not content" % _target,
+          "It is never content: do not copy it, or rules derived from it, into the rewritten "
+          "prompt itself." in _built, True)
+
+# The dictation often asks for a prompt or a plan to be produced. That ask belongs to the
+# assistant the rewrite is addressed to, so it must survive the rewrite rather than be
+# answered by it.
+_opt_fable = p.build_optimizer_prompt("fable")
+check("the optimizer keeps a dictated request for a prompt or a plan in the rewrite",
+      "the rewritten prompt still asks the assistant to produce it" in _opt_fable, True)
+check("the optimizer says its own rewrite does not fulfil that request",
+      "Your rewrite never counts as fulfilling it." in _opt_fable, True)
+check("the optimizer preserves pronouns and who they refer to",
+      "Do not change pronouns or who they refer to; the speaker's 'I' stays 'I'."
+      in _opt_fable, True)
+check("the optimizer preserves spoken uncertainty as uncertainty",
+      "as uncertainty instead of resolving it" in _opt_fable, True)
+check("the optimizer keeps a choice the speaker left to the assistant",
+      "When the speaker leaves a choice to the assistant, keep it a choice." in _opt_fable, True)
+check("the optimizer preserves URLs alongside the other concrete details",
+      "number, filename, URL, name, and constraint" in _opt_fable, True)
+check("brevity no longer competes with preserving what the speaker said",
+      ("Keep the prompt brief" in _opt_fable,
+       "brevity never justifies dropping something the speaker said" in _opt_fable),
+      (False, True))
 
 check_raises("an unknown optimizer target is a RuntimeError", RuntimeError,
              p.build_optimizer_prompt, "gpt")
@@ -935,6 +960,8 @@ check("something follows the dictation, so it is not in final prompt position",
           "Return only the rewritten prompt for the dictation between those markers."), True)
 check("each optimizer run gets a different nonce",
       p.build_optimizer_input("x", "fable") == p.build_optimizer_input("x", "fable"), False)
+check("the fenced optimizer input carries the whole instruction, not a summary of it",
+      _opt_fenced.startswith(p.build_optimizer_prompt("opus")), True)
 
 
 # --- prompt mode: the sanitizer keeps structure and strips wrappers -------------------------
