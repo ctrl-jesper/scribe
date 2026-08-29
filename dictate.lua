@@ -18,8 +18,6 @@
 -- takes too long, which is the same class of failure as the GC bug above. Every subprocess
 -- here is therefore started with hs.task (async); hs.execute (synchronous) is never used.
 
-local SCRIBE_VERSION = "0.1.1"
-
 -- Clean up any prior instance on reload (dofile re-runs this file); prevents duplicate listeners.
 if scribe then
     if scribe.ptt then scribe.ptt:stop() end
@@ -31,6 +29,7 @@ if scribe then
     if scribe.batchTimeout then scribe.batchTimeout:stop() end
     if scribe.animTimer then scribe.animTimer:stop() end          -- HUD morph / typing bounce / optimizing orbit
     if scribe.menuAnimTimer then scribe.menuAnimTimer:stop() end   -- menu-bar glyph animation
+    if scribe.screenWatcher then scribe.screenWatcher:stop() end   -- HUD re-anchor on screen change
     if scribe.hud then scribe.hud:delete() end
     if scribe.recTask then pcall(function() scribe.recTask:terminate() end) end
     hs.alert.closeAll(0)                           -- drop any lingering alert
@@ -56,6 +55,23 @@ local OUTPUT_PATH = STATE_DIR .. "/last-output.txt"   -- must match pipeline.py'
 local WAV         = STATE_DIR .. "/dictation.wav"
 local WORKER_PATH = APP_DIR .. "/stream_worker.py"
 local PIPELINE    = APP_DIR .. "/pipeline.py"
+
+-- install.sh writes the shipped version into SCRIBE_HOME/VERSION on every install and upgrade,
+-- so reading it fresh here means the menu-bar footer can never go stale the way a hardcoded
+-- literal once did (this file shipped "0.1.1" for a long time after the project reached 0.5.0,
+-- because nothing ever reminded anyone to bump it by hand). Missing or unreadable is reported
+-- as "unknown" rather than guessed, since a wrong version string is worse than an honest blank.
+local function readVersion()
+    local f = io.open(SCRIBE_HOME .. "/VERSION", "r")
+    if not f then return "unknown" end
+    local line = f:read("*l")
+    f:close()
+    if not line then return "unknown" end
+    local trimmed = line:match("^%s*(.-)%s*$")
+    if trimmed == "" then return "unknown" end
+    return trimmed
+end
+local SCRIBE_VERSION = readVersion()
 
 hs.fs.mkdir(SCRIBE_HOME)                       -- no-op when they already exist; the batch
 hs.fs.mkdir(STATE_DIR)                         -- recording needs STATE_DIR to be there
@@ -165,8 +181,24 @@ scribe.promptTarget = normalizePromptTarget(hs.settings.get("scribe.promptTarget
 -- straight, so a hand-edited plist or an older build cannot leave it holding a non-boolean.
 scribe.autoPolish = hs.settings.get("scribe.autoPolish") == true
 
+-- Matches pipeline.py's log() format exactly (same "%Y-%m-%d %H:%M:%S" strftime layout, same
+-- append-only file per line), so a bug report shows one merged timeline across both languages
+-- instead of the Lua side being invisible unless the Hammerspoon console happens to be open.
+-- Named "-lua" so the two languages never interleave writes to the same file from two processes.
+local LUA_LOG_PATH = STATE_DIR .. "/scribe-lua.log"
+
 local function log(message)
     print("[Scribe] " .. message)
+    -- Never allowed to break the caller: io.open returning nil (STATE_DIR missing, disk full,
+    -- permissions) is handled by silently doing nothing, exactly like pipeline.py's log()
+    -- swallows OSError for the same reason. This runs on task-completion and startup-check
+    -- callbacks only, never on a per-frame animation tick, so a slow disk here cannot stall the
+    -- push-to-talk path the file's header warns about.
+    local f = io.open(LUA_LOG_PATH, "a")
+    if f then
+        f:write(os.date("%Y-%m-%d %H:%M:%S") .. " " .. message .. "\n")
+        f:close()
+    end
 end
 
 -- A problem the user has to act on: say it on screen AND in the console, because the console
@@ -299,14 +331,44 @@ local function setBar(i, frame, isDot)
         isDot and { xRadius = DOT_D / 2, yRadius = DOT_D / 2 } or { xRadius = BAR_W / 2, yRadius = BAR_W / 2 })
 end
 
-local function showHUD()
+-- Draws (or redraws) the HUD, reusing the existing canvas so there is no per-dictation
+-- allocation cost. May throw: a canvas the window server has invalidated raises a Lua error on
+-- the very next method call that touches it, and showHUD() below is the only thing that ever
+-- catches that.
+local function showHUDOnce()
     if not scribe.hud then scribe.hud = makeHUD() end
+    -- Re-anchor on every show, not only at creation. hs.screen.mainScreen() means "the screen
+    -- holding the focused window", which can differ from the screen the HUD was originally built
+    -- on, so a canvas built once and never re-anchored can end up centered on a screen that has
+    -- since been unplugged, resized, or is simply not the one in front of the user any more.
+    scribe.hud:frame(screenCenterFrame(PILL_W, PILL_H))
     for i = 1, BAR_COUNT do setBar(i, barFrame(i, MIN_BAR_H), false) end
     -- The FROZEN target, not the live menu value: the badge must say what this dictation will
     -- actually do. It stays up through the whole lifecycle, optimizing included.
     setBadge(PROMPT_BADGES[scribe.activePromptTarget])
     scribe.hud:alpha(1)
     scribe.hud:show()
+end
+
+-- Self-heals a canvas the window server silently invalidated (the second way the HUD can vanish
+-- for good, alongside the stale-screen case showHUDOnce fixes above: hs.canvas can go bad across
+-- sleep/wake with no signal except the next method call throwing). Before this fix a broken
+-- scribe.hud was indistinguishable from a healthy one, since the only rebuild trigger anywhere in
+-- this file was scribe.hud being nil, which a broken canvas never is. On failure, discard the
+-- canvas and retry once with a freshly built one; only a second failure is surfaced to the user,
+-- since a self-heal that worked is not something they need to act on. This function must never
+-- throw past this point, or a broken HUD would also take down the dictation that triggered it.
+local function showHUD()
+    local ok, err = pcall(showHUDOnce)
+    if ok then return end
+    log("HUD draw failed, rebuilding: " .. tostring(err))
+    if scribe.hud then pcall(function() scribe.hud:delete() end) end
+    scribe.hud = nil
+    local retryOk, retryErr = pcall(showHUDOnce)
+    if not retryOk then
+        log("HUD rebuild also failed: " .. tostring(retryErr))
+        alertProblem("could not draw the HUD (dictation still works); see " .. LUA_LOG_PATH, 4)
+    end
 end
 
 local function hideHUD(fade)
@@ -1217,6 +1279,26 @@ scribe.ptt:start()
 resolveMic()
 hs.audiodevice.watcher.setCallback(function() resolveMic() end)
 hs.audiodevice.watcher.start()
+
+-- Mirrors the microphone watcher above for the same reason on the other input: re-anchor (or, if
+-- the canvas itself broke, discard) the HUD whenever the screen configuration changes, rather
+-- than waiting for the next dictation's showHUD() to notice. Without this, unplugging the screen
+-- the HUD was drawn on, or the focused window moving to a different display between dictations,
+-- leaves a canvas positioned for a screen that may no longer exist until the user happens to
+-- dictate again. Placed after every local function it references (screenCenterFrame), per the
+-- forward-reference hazard explained above stopRecording; do not move this above that point.
+scribe.screenWatcher = hs.screen.watcher.new(function()
+    if not scribe.hud then return end   -- nothing to re-anchor; the next show() builds fresh
+    local ok = pcall(function() scribe.hud:frame(screenCenterFrame(PILL_W, PILL_H)) end)
+    if not ok then
+        -- The canvas itself is what broke, not just its position. Discard it so the next
+        -- showHUD() rebuilds from scratch instead of repeating a frame() call that would just
+        -- keep failing the same way.
+        pcall(function() scribe.hud:delete() end)
+        scribe.hud = nil
+    end
+end)
+scribe.screenWatcher:start()
 
 -- On-demand polish: upgrade the LAST instant dictation via the LLM (~11s), then paste it.
 -- Tip: undo the instant paste first, then polish, so you replace rather than duplicate.
