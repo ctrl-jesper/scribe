@@ -2,6 +2,30 @@
 
 All notable changes to Scribe are documented in this file.
 
+## [0.5.1] - 2026-08-29
+
+### Fixed
+
+- **The HUD could vanish permanently.** Dictation, transcription and pasting kept working, but
+  the pill stopped appearing until Hammerspoon was reloaded. The canvas was built exactly once
+  and the only trigger to rebuild it was the handle being `nil`, which a broken canvas never
+  is, so nothing could ever notice it had gone bad. It is now re-anchored to the current screen
+  on every show, and a failed draw discards the canvas and rebuilds it once, so the worst case
+  is a single dictation without a HUD rather than every dictation until a reload.
+- **The HUD is no longer pinned to the screen it was first drawn on.** A new screen watcher
+  re-anchors it when the display configuration changes, mirroring what the microphone watcher
+  already did for audio devices. `hs.screen.mainScreen()` means "the screen holding the focused
+  window", so this was never a multi-monitor-only problem.
+- **The menu bar reported the wrong version.** It had said 0.1.1 since that release because the
+  string was hardcoded; it is now read from the `VERSION` file the installer writes, so it
+  cannot go stale again.
+
+### Added
+
+- A log file for the Hammerspoon side at `~/.config/scribe/state/scribe-lua.log`, in the same
+  format as the Python log. Lua-side failures previously went only to the Hammerspoon console,
+  which is why the HUD bug above could run for weeks leaving no evidence.
+
 ## [0.5.0] - 2026-08-27
 
 ### Added

@@ -232,7 +232,7 @@ File locations:
 | `~/.config/scribe/dictionary.json` | Replacement rules |
 | `~/.config/scribe/models/` | The downloaded speech model |
 | `~/.config/scribe/app/` | Installed app code (`pipeline.py`, `stream_worker.py`, `dictate.lua`, `scribe_setup.py`) |
-| `~/.config/scribe/state/` | Recording, transcript, and server log files (see Privacy, below) |
+| `~/.config/scribe/state/` | Recording, transcript, and server log files (see Privacy, below). `scribe.log` is the pipeline's, `scribe-lua.log` the Hammerspoon side's |
 
 ## How it works
 

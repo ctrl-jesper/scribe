@@ -17,7 +17,7 @@ local too.
 
 ## Where things stand
 
-Shipped and public at github.com/ctrl-jesper/scribe, currently **v0.5.0**. The maintainer runs
+Shipped and public at github.com/ctrl-jesper/scribe, currently **v0.5.1**. The maintainer runs
 this exact codebase as his daily driver: his personal config lives in `~/.config/scribe/`
 (never in the repo), and `install.sh` upgrades him in place without touching it.
 
@@ -113,6 +113,14 @@ Hard-won, in roughly the order the lessons hurt:
 - The 0.5.0 Lua changes (latch, the recording cap, the menu-bar marker) parse under a real Lua
   compiler in CI, but their runtime behaviour was confirmed only by the maintainer reloading
   Hammerspoon. If something about the gesture or the timer misbehaves, that is where to look.
+- `hideHUD(true)` fades over 0.3s, and a dictation starting inside that window calls `show()`
+  while the fade is still in flight, which may cause an occasional one-off missing HUD. Found
+  while diagnosing the permanent-HUD bug in 0.5.1, deliberately left unfixed: it is transient,
+  lower confidence, and mixing it into that fix would have been a refactor-while-fixing. If the
+  maintainer reports a HUD that misses once and then recovers by itself, this is the suspect.
+- The Lua side now logs to `state/scribe-lua.log`. Read it FIRST for any HUD or hotkey report:
+  before 0.5.1 those failures went only to the Hammerspoon console and left no evidence at all,
+  which is precisely why the permanent-HUD bug survived for weeks.
 
 ## The maintainer
 
