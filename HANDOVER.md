@@ -17,7 +17,7 @@ local too.
 
 ## Where things stand
 
-Shipped and public at github.com/ctrl-jesper/scribe, currently **v0.5.1**. The maintainer runs
+Shipped and public at github.com/ctrl-jesper/scribe, currently **v0.5.2**. The maintainer runs
 this exact codebase as his daily driver: his personal config lives in `~/.config/scribe/`
 (never in the repo), and `install.sh` upgrades him in place without touching it.
 

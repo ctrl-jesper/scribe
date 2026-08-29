@@ -844,6 +844,23 @@ _gone_code, _gone_out, _gone_err = finish_capturing(["keep my words"], optimize_
 check("a missing claude CLI is a fallback, not a crash", _gone_code, sw.EXIT_OPTIMIZER_FALLBACK)
 check("no marker is printed when the CLI is never invoked", _gone_out, "keep my words\n")
 
+# A claude_bin that exists but cannot be executed used to raise PermissionError out of
+# subprocess.run. In streaming nothing is persisted until after the rewrite, so that did not
+# just skip it, it lost the dictation: no clipboard, no last-output.txt, no last-dict.txt.
+# It must degrade to the same fallback as a missing CLI, exactly like the polish path below.
+_opt_unrunnable_claude = write_script("opt-unrunnable-claude", "exit 0\n")
+os.chmod(_opt_unrunnable_claude, 0o644)
+_copied[:] = []
+sw.pipeline.copy_to_clipboard = lambda text: (_copied.append(text), True)[1]
+_opt_unrunnable_code, _opt_unrunnable_out, _ = finish_capturing(
+    ["keep my words"], optimize_for="opus", copy=True,
+    cfg=dict(OPT_CFG, claude_bin=_opt_unrunnable_claude))
+check("an unrunnable optimizer claude_bin is a fallback, not a crash",
+      (_opt_unrunnable_code, _opt_unrunnable_out),
+      (sw.EXIT_OPTIMIZER_FALLBACK, "keep my words\n"))
+check("the dictation still reaches the clipboard when the optimizer CLI cannot be executed",
+      _copied, ["keep my words"])
+
 
 # --- 6c2. auto-polish: the same finish path, the same fail-safe, its own marker and code ------
 # The polish itself is pipeline's, and pipeline's own tests cover its prompt and isolation.

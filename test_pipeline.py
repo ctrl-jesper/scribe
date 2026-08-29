@@ -913,6 +913,31 @@ for _target in p.OPTIMIZE_TARGETS:
           "Output ONLY the rewritten prompt" in _built, True)
     check("optimizer prompt for %s allows a multi-line answer" % _target,
           "may span several lines" in _built, True)
+    check("optimizer prompt for %s marks the target block as guidance, not content" % _target,
+          "It is never content: do not copy it, or rules derived from it, into the rewritten "
+          "prompt itself." in _built, True)
+
+# The dictation often asks for a prompt or a plan to be produced. That ask belongs to the
+# assistant the rewrite is addressed to, so it must survive the rewrite rather than be
+# answered by it.
+_opt_fable = p.build_optimizer_prompt("fable")
+check("the optimizer keeps a dictated request for a prompt or a plan in the rewrite",
+      "the rewritten prompt still asks the assistant to produce it" in _opt_fable, True)
+check("the optimizer says its own rewrite does not fulfil that request",
+      "Your rewrite never counts as fulfilling it." in _opt_fable, True)
+check("the optimizer preserves pronouns and who they refer to",
+      "Do not change pronouns or who they refer to; the speaker's 'I' stays 'I'."
+      in _opt_fable, True)
+check("the optimizer preserves spoken uncertainty as uncertainty",
+      "as uncertainty instead of resolving it" in _opt_fable, True)
+check("the optimizer keeps a choice the speaker left to the assistant",
+      "When the speaker leaves a choice to the assistant, keep it a choice." in _opt_fable, True)
+check("the optimizer preserves URLs alongside the other concrete details",
+      "number, filename, URL, name, and constraint" in _opt_fable, True)
+check("brevity no longer competes with preserving what the speaker said",
+      ("Keep the prompt brief" in _opt_fable,
+       "brevity never justifies dropping something the speaker said" in _opt_fable),
+      (False, True))
 
 check_raises("an unknown optimizer target is a RuntimeError", RuntimeError,
              p.build_optimizer_prompt, "gpt")
@@ -935,6 +960,8 @@ check("something follows the dictation, so it is not in final prompt position",
           "Return only the rewritten prompt for the dictation between those markers."), True)
 check("each optimizer run gets a different nonce",
       p.build_optimizer_input("x", "fable") == p.build_optimizer_input("x", "fable"), False)
+check("the fenced optimizer input carries the whole instruction, not a summary of it",
+      _opt_fenced.startswith(p.build_optimizer_prompt("opus")), True)
 
 
 # --- prompt mode: the sanitizer keeps structure and strips wrappers -------------------------
@@ -1022,6 +1049,37 @@ check("a missing CLI falls back rather than raising", _blocked_result, None)
 check("no OPTIMIZING marker is printed when the CLI is never invoked",
       p.PHASE_OPTIMIZING in _blocked_out, False)
 check("the blocked fallback says why on stderr", "[optimize fallback]" in _blocked_err, True)
+
+# A claude_bin that exists but cannot be executed used to pass optimizer_blocked_reason and
+# then raise PermissionError out of subprocess.run, reachable from prompt mode. It has to
+# block here, exactly like being absent, the same fix polish_blocked_reason already has.
+_opt_real_bin = os.path.join(FAKE_BIN, "opt-not-executable-yet")
+open(_opt_real_bin, "w").close()                  # exists, but not executable yet
+_opt_unexecutable_cfg = dict(OPT_CFG, claude_bin=_opt_real_bin)
+check("optimizer blocked when claude_bin exists but is not executable",
+      p.optimizer_blocked_reason(_opt_unexecutable_cfg) is not None, True)
+check("the not-executable reason names the file and says why",
+      (_opt_real_bin in p.optimizer_blocked_reason(_opt_unexecutable_cfg),
+       "not executable" in p.optimizer_blocked_reason(_opt_unexecutable_cfg)), (True, True))
+os.chmod(_opt_real_bin, os.stat(_opt_real_bin).st_mode | stat.S_IEXEC)
+check("optimizer unblocked once the claude_bin is executable",
+      p.optimizer_blocked_reason(_opt_unexecutable_cfg), None)
+
+# ...and if it somehow gets past that check (replaced between the check and the exec), the
+# OSError is still a fallback rather than a crash, mirroring polish_with_status's own guard.
+_saved_opt_oserror_run = p.subprocess.run
+
+
+def _explode_opt_run(*_args, **_kwargs):
+    raise PermissionError(13, "Permission denied")
+
+
+p.subprocess.run = _explode_opt_run
+_opt_boom, _opt_boom_out, _opt_boom_err = optimize_capturing("keep my words", OPT_CFG, "opus")
+p.subprocess.run = _saved_opt_oserror_run
+check("an OSError from the optimizer CLI falls back instead of raising", _opt_boom, None)
+check("the OSError fallback says why on stderr",
+      "could not run the claude CLI" in _opt_boom_err, True)
 
 
 # --- prompt mode: the phase marker is printed BEFORE the CLI is invoked ----------------------
@@ -1436,6 +1494,23 @@ check("the unoptimized words survive an empty answer too",
       open(CLIPBOARD).read(), "words that survive an empty rewrite")
 check("exit 4 is distinct from the failure and empty codes",
       (p.EXIT_OPTIMIZER_FALLBACK, p.EXIT_FAIL, p.EXIT_EMPTY), (4, 1, 3))
+
+# The same regression as the polish path below: a claude_bin that exists but cannot be
+# executed used to raise PermissionError out of subprocess.run and lose the dictation on the
+# batch path too, reachable from --optimize-for.
+_opt_unrunnable = os.path.join(FAKE_BIN, "opt-unrunnable-claude")
+with open(_opt_unrunnable, "w") as _opt_fh:
+    _opt_fh.write("#!/bin/sh\nexit 0\n")
+os.chmod(_opt_unrunnable, 0o644)
+OPT_UNRUNNABLE_HOME = optimize_home(_opt_unrunnable, "scribe-test-opt-unrunnable-")
+StubWhisper.text = "words a broken optimizer must not swallow"
+_opt_unrunnable_run = run_cli(
+    [recorded_wav(OPT_UNRUNNABLE_HOME), "--optimize-for", "opus", "--copy"],
+    home=OPT_UNRUNNABLE_HOME)
+check("a claude_bin that cannot be executed gives exit code 4, not a crash",
+      _opt_unrunnable_run.returncode, p.EXIT_OPTIMIZER_FALLBACK)
+check("the raw words survive an unrunnable optimizer CLI",
+      open(CLIPBOARD).read(), "words a broken optimizer must not swallow")
 
 
 # --- auto-polish end to end: --mode full, the marker, the clipboard, and exit 5 ---------------

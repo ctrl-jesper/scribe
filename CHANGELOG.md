@@ -2,6 +2,24 @@
 
 All notable changes to Scribe are documented in this file.
 
+## [0.5.2] - 2026-08-29
+
+### Fixed
+
+- Prompt mode no longer swallows a dictation that asks for something to be written. Say "write
+  me a prompt for X" or "draft me a plan for Y" and the rewrite now hands that request on to
+  your target model instead of quietly treating its own output as the answer.
+- Prompt mode keeps more of what you actually said: URLs and names now sit alongside numbers
+  and filenames in the preserve list, a spoken "maybe" or "I'm not sure" stays a hedge instead
+  of being resolved into a decision, a choice you left open for the assistant stays open, and
+  your pronouns are left as spoken.
+- Brevity no longer outranks fidelity when the prompt is aimed at Fable. The instruction to
+  keep the prompt short had been competing with the instruction to preserve everything, and
+  short was winning, which cost the odd URL or hedge.
+- The per-model writing guidance can no longer leak into the rewritten prompt. Lines meant to
+  shape how the prompt is written, such as the note not to ask the model to narrate its
+  reasoning, occasionally came back out as content you never dictated.
+
 ## [0.5.1] - 2026-08-29
 
 ### Fixed
@@ -25,7 +43,6 @@ All notable changes to Scribe are documented in this file.
 - A log file for the Hammerspoon side at `~/.config/scribe/state/scribe-lua.log`, in the same
   format as the Python log. Lua-side failures previously went only to the Hammerspoon console,
   which is why the HUD bug above could run for weeks leaving no evidence.
-
 ## [0.5.0] - 2026-08-27
 
 ### Added
